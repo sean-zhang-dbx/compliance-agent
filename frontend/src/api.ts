@@ -26,7 +26,12 @@ export async function sendMessage(
   });
 
   if (!response.ok) {
-    throw new Error(`Agent error: ${response.status} ${response.statusText}`);
+    let detail = response.statusText;
+    try {
+      const errData = await response.json();
+      detail = errData.detail || detail;
+    } catch { /* ignore parse errors */ }
+    throw new Error(`Agent error (${response.status}): ${detail}`);
   }
 
   const data = await response.json();

@@ -161,14 +161,20 @@ async def invocations(request: dict):
     from agent.agent import AGENT
     from mlflow.types.responses import ResponsesAgentRequest
 
+    messages = request.get("input") or []
+    if not messages or not any(m.get("content") for m in messages):
+        raise HTTPException(400, "Please provide at least one message with content.")
+
     try:
         agent_request = ResponsesAgentRequest(**request)
         response = AGENT.predict(agent_request)
         return response.model_dump(exclude_none=True)
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"Agent error: {e}")
 
 
 @app.post("/invocations/stream")
@@ -190,11 +196,19 @@ async def invocations_stream(request: dict):
 
 
 # ---------------------------------------------------------------------------
-# Static frontend
+# Static frontend + SPA catch-all
 # ---------------------------------------------------------------------------
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+    _index_html = FRONTEND_DIR / "index.html"
+
+    @app.get("/{full_path:path}")
+    async def spa_catch_all(full_path: str):
+        """Serve static assets if they exist, otherwise fall back to index.html for SPA routing."""
+        file = FRONTEND_DIR / full_path
+        if full_path and file.exists() and file.is_file():
+            return FileResponse(file)
+        return FileResponse(_index_html)
 else:
     @app.get("/")
     async def root():
