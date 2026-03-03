@@ -5,12 +5,33 @@ export interface AgentMessage {
   content: string;
 }
 
+export interface ToolStep {
+  tool: string;
+  label: string;
+  args_summary: string;
+  status: "running" | "complete" | "error";
+  result_summary?: string;
+  duration?: number;
+  artifact?: string;
+  artifact_volume_path?: string;
+  workbook_artifact?: string;
+}
+
 export interface UploadResult {
   filename: string;
   size_bytes: number;
   local_path: string;
   volume_path: string | null;
   status: string;
+}
+
+export interface RunInfo {
+  run_id: string;
+  status?: string;
+  started_at?: string;
+  completed_at?: string;
+  total_steps?: number;
+  artifact_count?: number;
 }
 
 function extractText(data: Record<string, unknown>): string {
@@ -34,9 +55,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export interface SendResult {
+  message: AgentMessage;
+  runId: string;
+  projectDir: string;
+}
+
+export async function cancelTask(taskId: string): Promise<void> {
+  await fetch(`${BACKEND_URL}/api/tasks/${taskId}/cancel`, {
+    method: "POST",
+    credentials: "include",
+  });
+}
+
 export async function sendMessage(
-  messages: AgentMessage[]
-): Promise<AgentMessage> {
+  messages: AgentMessage[],
+  onStepsUpdate?: (steps: ToolStep[], currentStep: string | null, elapsed: number) => void,
+  onTaskId?: (taskId: string) => void,
+  signal?: AbortSignal,
+): Promise<SendResult> {
   const response = await fetch(`${BACKEND_URL}/invocations`, {
     method: "POST",
     credentials: "include",
@@ -44,6 +81,7 @@ export async function sendMessage(
     body: JSON.stringify({
       input: messages.map((m) => ({ role: m.role, content: m.content })),
     }),
+    signal,
   });
 
   if (!response.ok) {
@@ -51,7 +89,7 @@ export async function sendMessage(
     try {
       const errData = await response.json();
       detail = errData.detail || detail;
-    } catch { /* ignore parse errors */ }
+    } catch { /* ignore */ }
     throw new Error(`Agent error (${response.status}): ${detail}`);
   }
 
@@ -59,34 +97,66 @@ export async function sendMessage(
 
   if (data.task_id) {
     const taskId = data.task_id as string;
+    onTaskId?.(taskId);
     const maxPollTime = 600_000;
     const start = Date.now();
     let pollInterval = 2000;
+    let runId = (data.run_id as string) || "";
+    let projectDir = "";
 
     while (Date.now() - start < maxPollTime) {
       await sleep(pollInterval);
-      if (pollInterval < 5000) pollInterval += 500;
+      if (signal?.aborted) throw new Error("Cancelled");
+      if (pollInterval < 4000) pollInterval += 500;
 
       const pollResp = await fetch(`${BACKEND_URL}/api/tasks/${taskId}`, {
         credentials: "include",
+        signal,
       });
       if (!pollResp.ok) {
         throw new Error(`Poll error (${pollResp.status})`);
       }
       const pollData = await pollResp.json();
+      runId = pollData.run_id || runId;
+      projectDir = pollData.project_dir || projectDir;
 
-      if (pollData.status === "running") continue;
+      if (onStepsUpdate && pollData.steps) {
+        onStepsUpdate(
+          pollData.steps as ToolStep[],
+          pollData.current_step || null,
+          pollData.elapsed_seconds || 0,
+        );
+      }
+
+      if (pollData.status === "running" || pollData.status === "cancelling") continue;
+      if (pollData.status === "cancelled") {
+        if (onStepsUpdate && pollData.steps) {
+          onStepsUpdate(pollData.steps as ToolStep[], null, 0);
+        }
+        throw new Error("Run cancelled by user.");
+      }
       if (pollData.status === "error") {
         throw new Error(`Agent error: ${pollData.detail || "unknown"}`);
       }
       if (pollData.status === "complete") {
-        return { role: "assistant", content: extractText(pollData) || "Agent completed processing." };
+        if (onStepsUpdate && pollData.steps) {
+          onStepsUpdate(pollData.steps as ToolStep[], null, pollData.elapsed_seconds || 0);
+        }
+        return {
+          message: { role: "assistant", content: extractText(pollData) || "Agent completed processing." },
+          runId,
+          projectDir,
+        };
       }
     }
     throw new Error("Agent timed out after 10 minutes.");
   }
 
-  return { role: "assistant", content: extractText(data) || "Agent completed processing." };
+  return {
+    message: { role: "assistant", content: extractText(data) || "Agent completed processing." },
+    runId: "",
+    projectDir: "",
+  };
 }
 
 export async function uploadFile(file: File): Promise<UploadResult> {
@@ -127,4 +197,146 @@ export async function listProjects(): Promise<ProjectInfo[]> {
   if (!response.ok) return [];
   const data = await response.json();
   return data.projects || [];
+}
+
+export interface EvidenceFile {
+  path: string;
+  type: string;
+  focus?: string;
+}
+
+export interface Engagement {
+  number?: string;
+  name?: string;
+  instructions?: string;
+  control_objective?: {
+    control_id?: string;
+    control_name?: string;
+    domain?: string;
+    policy_reference?: string;
+    rules?: Record<string, unknown>;
+  };
+  testing_attributes?: Array<{ ref: string; name: string; applies_to?: string }>;
+  evidence_files?: EvidenceFile[];
+  notification_emails?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+export async function fetchEngagement(projectDir: string): Promise<Engagement | null> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/projects/${projectDir}/engagement`, {
+      credentials: "include",
+    });
+    if (!response.ok) return null;
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
+export function getEvidenceUrl(projectDir: string, filepath: string): string {
+  return `${BACKEND_URL}/api/projects/${projectDir}/evidence/${filepath}`;
+}
+
+export async function listRuns(projectDir: string): Promise<RunInfo[]> {
+  const response = await fetch(`${BACKEND_URL}/api/runs/${projectDir}`, { credentials: "include" });
+  if (!response.ok) return [];
+  const data = await response.json();
+  return data.runs || [];
+}
+
+export interface RunManifest {
+  run_id: string;
+  status?: string;
+  started_at?: string;
+  completed_at?: string;
+  steps?: ToolStep[];
+  total_steps?: number;
+  [key: string]: unknown;
+}
+
+export async function fetchRunManifest(projectDir: string, runId: string): Promise<RunManifest | null> {
+  try {
+    const text = await fetchArtifact(projectDir, runId, "run_manifest.json");
+    return JSON.parse(text) as RunManifest;
+  } catch {
+    return null;
+  }
+}
+
+export async function pollTask(
+  taskId: string,
+  onStepsUpdate?: (steps: ToolStep[], currentStep: string | null, elapsed: number) => void,
+  signal?: AbortSignal,
+): Promise<SendResult> {
+  const maxPollTime = 600_000;
+  const start = Date.now();
+  let pollInterval = 2000;
+  let runId = "";
+  let projectDir = "";
+
+  while (Date.now() - start < maxPollTime) {
+    await sleep(pollInterval);
+    if (signal?.aborted) throw new Error("Cancelled");
+    if (pollInterval < 4000) pollInterval += 500;
+
+    const pollResp = await fetch(`${BACKEND_URL}/api/tasks/${taskId}`, {
+      credentials: "include",
+      signal,
+    });
+    if (!pollResp.ok) throw new Error(`Poll error (${pollResp.status})`);
+    const pollData = await pollResp.json();
+    runId = pollData.run_id || runId;
+    projectDir = pollData.project_dir || projectDir;
+
+    if (onStepsUpdate && pollData.steps) {
+      onStepsUpdate(pollData.steps as ToolStep[], pollData.current_step || null, pollData.elapsed_seconds || 0);
+    }
+
+    if (pollData.status === "running" || pollData.status === "cancelling") continue;
+    if (pollData.status === "cancelled") {
+      if (onStepsUpdate && pollData.steps) onStepsUpdate(pollData.steps as ToolStep[], null, 0);
+      throw new Error("Run cancelled by user.");
+    }
+    if (pollData.status === "error") throw new Error(`Agent error: ${pollData.detail || "unknown"}`);
+    if (pollData.status === "complete") {
+      if (onStepsUpdate && pollData.steps) onStepsUpdate(pollData.steps as ToolStep[], null, pollData.elapsed_seconds || 0);
+      return {
+        message: { role: "assistant", content: extractText(pollData) || "Agent completed processing." },
+        runId,
+        projectDir,
+      };
+    }
+  }
+  throw new Error("Agent timed out after 10 minutes.");
+}
+
+export async function fetchArtifact(projectDir: string, runId: string, filename: string): Promise<string> {
+  const response = await fetch(
+    `${BACKEND_URL}/api/artifacts/${projectDir}/${runId}/${filename}`,
+    { credentials: "include" },
+  );
+  if (!response.ok) throw new Error(`Artifact not found (${response.status})`);
+  return response.text();
+}
+
+export async function downloadBinaryArtifact(
+  projectDir: string,
+  runId: string,
+  filename: string,
+): Promise<void> {
+  const response = await fetch(
+    `${BACKEND_URL}/api/artifacts/${projectDir}/${runId}/${filename}`,
+    { credentials: "include" },
+  );
+  if (!response.ok) throw new Error(`Download failed (${response.status})`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }

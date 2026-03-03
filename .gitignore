@@ -21,3 +21,10 @@ sample_data/projects/*/sent_email_*.eml
 deploy_app/sample_data/projects/*/report_*.md
 deploy_app/sample_data/projects/*/report_*.json
 deploy_app/sample_data/projects/*/sent_email_*.eml
+
+# Excel temp files
+~$*.xlsx
+
+# Databricks Asset Bundles
+.databricks/
+bundle_deploy_output/

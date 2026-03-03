@@ -1,0 +1,34 @@
+resources:
+  jobs:
+    setup_sample_data:
+      name: "[${bundle.target}] GSK Compliance — Setup Sample Data"
+      description: >
+        Generates synthetic FRMC control testing projects (engagement metadata,
+        workbooks, evidence files) and uploads them to the UC Volume.
+        Run once to bootstrap, or on-demand to refresh sample data.
+
+      tasks:
+        - task_key: generate_and_upload
+          notebook_task:
+            notebook_path: ../src/notebooks/setup_sample_data.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              volume: ${var.volume}
+            source: WORKSPACE
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+
+      tags:
+        project: gsk-compliance-agent
+        team: field-engineering
+
+      permissions:
+        - level: CAN_VIEW
+          group_name: users

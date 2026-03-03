@@ -74,6 +74,18 @@ def _read_file_bytes(file_path: str) -> bytes:
     if fb.exists():
         return fb.read_bytes()
 
+    # Last resort: treat as relative path under the UC Volume projects dir
+    if not file_path.startswith("/"):
+        for prefix in (PROJECTS_BASE_PATH, VOLUME_PATH):
+            vol_candidate = f"{prefix}/{file_path}"
+            try:
+                from databricks.sdk import WorkspaceClient
+                w = WorkspaceClient()
+                resp = w.files.download(vol_candidate)
+                return resp.contents.read()
+            except Exception:
+                continue
+
     raise FileNotFoundError(
         f"Cannot find '{file_path}'. Checked: {p}, sample_data (recursive), UC SDK, {fb}"
     )
@@ -442,7 +454,7 @@ def review_document(file_path: str, context: str = "", focus_area: Optional[str]
         JSON string with file_path, document_type, review_focus, and analysis.
     """
     from databricks_langchain import ChatDatabricks
-    from agent.config import VISION_LLM_ENDPOINT
+    from agent.config import FAST_LLM_ENDPOINT
 
     content = _read_file_bytes(file_path)
     ext = Path(file_path).suffix.lower()
@@ -481,7 +493,7 @@ def review_document(file_path: str, context: str = "", focus_area: Optional[str]
         f"Document text content:\n\n{text_content[:10000]}"
     )
 
-    llm = ChatDatabricks(endpoint=VISION_LLM_ENDPOINT, temperature=0)
+    llm = ChatDatabricks(endpoint=FAST_LLM_ENDPOINT, temperature=0)
     response = llm.invoke(prompt)
 
     return json.dumps({
@@ -561,7 +573,7 @@ def analyze_email(file_path: str, context: str = "", focus_area: Optional[str] =
         JSON string with email metadata and analysis.
     """
     from databricks_langchain import ChatDatabricks
-    from agent.config import LLM_ENDPOINT
+    from agent.config import FAST_LLM_ENDPOINT
     import email
     from email import policy as email_policy
 
@@ -608,7 +620,7 @@ def analyze_email(file_path: str, context: str = "", focus_area: Optional[str] =
         f"6. Summary of compliance findings\n"
     )
 
-    llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0)
+    llm = ChatDatabricks(endpoint=FAST_LLM_ENDPOINT, temperature=0)
     response = llm.invoke(prompt)
 
     return json.dumps({
@@ -623,8 +635,181 @@ def analyze_email(file_path: str, context: str = "", focus_area: Optional[str] =
 
 
 # =========================================================================
+# Test plan generation (deterministic)
+# =========================================================================
+
+@tool
+def generate_test_plan(
+    engagement_json: str,
+    workbook_json: str,
+) -> str:
+    """Generate a deterministic test plan from the engagement and workbook data.
+
+    Call this AFTER load_engagement and parse_workbook. It computes the exact
+    list of (attribute, sample_item) pairs that must be tested. Then execute
+    each entry in the plan using execute_test.
+
+    Args:
+        engagement_json: The full engagement JSON returned by load_engagement.
+        workbook_json: The full workbook JSON returned by parse_workbook.
+
+    Returns:
+        JSON with the ordered test_plan (list of tests to execute) and
+        total_tests count. Each entry has test_ref, attribute, procedure,
+        applies_to, and sample_item_json.
+    """
+    engagement = json.loads(engagement_json) if isinstance(engagement_json, str) else engagement_json
+    workbook = json.loads(workbook_json) if isinstance(workbook_json, str) else workbook_json
+
+    attributes = engagement.get("testing_attributes", [])
+    rules = engagement.get("control_objective", {}).get("rules", {})
+    threshold = rules.get("threshold_gbp", rules.get("threshold_usd", rules.get("threshold", 0)))
+
+    selected_sample = workbook.get("selected_sample", [])
+    wb_attributes = workbook.get("testing_attributes", [])
+
+    attr_procedures = {}
+    for wa in wb_attributes:
+        attr_procedures[wa.get("ref", "")] = wa.get("procedure", wa.get("attribute", ""))
+
+    test_plan = []
+
+    for attr in attributes:
+        ref = attr.get("ref", "?")
+        name = attr.get("name", "")
+        applies_to = attr.get("applies_to", "all")
+        procedure = attr_procedures.get(ref, name)
+
+        if applies_to == "control_level":
+            test_plan.append({
+                "test_ref": ref,
+                "attribute": name,
+                "procedure": procedure,
+                "applies_to": applies_to,
+                "sample_item_json": json.dumps({
+                    "_type": "population_level",
+                    "population_size": workbook.get("sampling_config", {}).get("Population Size",
+                                       workbook.get("sampling_config", {}).get("Total Population", "unknown")),
+                }),
+            })
+        elif applies_to in ("all",):
+            for item in selected_sample:
+                test_plan.append({
+                    "test_ref": ref,
+                    "attribute": name,
+                    "procedure": procedure,
+                    "applies_to": applies_to,
+                    "sample_item_json": json.dumps(item),
+                })
+            if not selected_sample:
+                test_plan.append({
+                    "test_ref": ref,
+                    "attribute": name,
+                    "procedure": procedure,
+                    "applies_to": applies_to,
+                    "sample_item_json": json.dumps({"_type": "no_sample_available"}),
+                })
+        else:
+            matched_items = []
+            for item in selected_sample:
+                amount_str = ""
+                for k, v in item.items():
+                    kl = k.lower()
+                    if any(w in kl for w in ["amount", "value", "total", "gbp", "usd"]):
+                        amount_str = str(v).replace(",", "").replace("£", "").replace("$", "").strip()
+                        break
+
+                if applies_to == "above_threshold" and threshold:
+                    try:
+                        if float(amount_str) >= float(threshold):
+                            matched_items.append(item)
+                    except (ValueError, TypeError):
+                        matched_items.append(item)
+                else:
+                    matched_items.append(item)
+
+            if matched_items:
+                for item in matched_items:
+                    test_plan.append({
+                        "test_ref": ref,
+                        "attribute": name,
+                        "procedure": procedure,
+                        "applies_to": applies_to,
+                        "sample_item_json": json.dumps(item),
+                    })
+            else:
+                test_plan.append({
+                    "test_ref": ref,
+                    "attribute": name,
+                    "procedure": procedure,
+                    "applies_to": applies_to,
+                    "sample_item_json": json.dumps({"_type": "no_applicable_items", "filter": applies_to}),
+                })
+
+    return json.dumps({
+        "test_plan": test_plan,
+        "total_tests": len(test_plan),
+        "attributes_count": len(attributes),
+        "sample_size": len(selected_sample),
+        "instruction": "Execute EVERY entry in test_plan using execute_test. Do NOT skip any.",
+    }, indent=2)
+
+
+# =========================================================================
 # Test execution + report
 # =========================================================================
+
+def _run_pre_checks(test_ref: str, attribute: str, sample_item: dict, control_context_str: str) -> str:
+    """Run deterministic data-level checks before the LLM analysis.
+
+    Returns a string of pre-check findings to inject into the LLM prompt.
+    """
+    findings = []
+    attr_lower = attribute.lower()
+
+    try:
+        ctx = json.loads(control_context_str) if isinstance(control_context_str, str) else control_context_str
+    except Exception:
+        ctx = {}
+    rules = ctx.get("rules", {})
+
+    preparer = sample_item.get("Preparer", "")
+    approver = sample_item.get("Approver", "")
+    if preparer and approver and ("self-approval" in attr_lower or "dual auth" in attr_lower):
+        if preparer.strip().lower() == approver.strip().lower():
+            findings.append(f"DATA CHECK FAIL: Preparer ({preparer}) = Approver ({approver}). Self-approval detected.")
+        else:
+            findings.append(f"DATA CHECK PASS: Preparer ({preparer}) != Approver ({approver}). Dual authorization verified.")
+
+    threshold = rules.get("threshold_gbp", rules.get("threshold_usd", 0))
+    if threshold and ("threshold" in attr_lower or "above" in attr_lower):
+        for key in ("Amount_GBP", "Amount_in_GBP", "Amount"):
+            if key in sample_item:
+                try:
+                    amt = float(str(sample_item[key]).replace(",", "").replace("£", "").replace("$", ""))
+                    if amt >= float(threshold):
+                        findings.append(f"DATA CHECK: Amount ({amt:,.2f}) >= threshold ({threshold:,}). Finance Director review required.")
+                    else:
+                        findings.append(f"DATA CHECK: Amount ({amt:,.2f}) < threshold ({threshold:,}). Below threshold — attribute may be N/A.")
+                except (ValueError, TypeError):
+                    pass
+                break
+
+    if "supporting doc" in attr_lower or "documentation" in attr_lower:
+        sup = sample_item.get("Supporting_Doc", sample_item.get("supporting_doc", ""))
+        if isinstance(sup, str) and not sup.strip():
+            findings.append("DATA CHECK FAIL: Supporting_Doc field is empty — no documentation attached.")
+        elif sup:
+            findings.append(f"DATA CHECK PASS: Supporting document referenced: {sup}")
+
+    if "period" in attr_lower or "posting" in attr_lower:
+        posting_date = sample_item.get("Posting_Date", "")
+        period = sample_item.get("Period", "")
+        if posting_date and period:
+            findings.append(f"DATA CHECK: Posting_Date={posting_date}, Period={period}. Verify period assignment is correct.")
+
+    return "\n".join(findings) if findings else ""
+
 
 @tool
 def execute_test(
@@ -652,10 +837,18 @@ def execute_test(
     from agent.config import LLM_ENDPOINT
     from agent.prompts import TEST_EXECUTION_PROMPT
 
+    import time as _time
+
     sample_item = json.loads(sample_item_json) if sample_item_json else {}
 
+    pre_checks = _run_pre_checks(test_ref, attribute, sample_item, control_context)
+
     with mlflow.start_span(name=f"test_{test_ref}", span_type="TOOL") as span:
-        span.set_inputs({"test_ref": test_ref, "attribute": attribute, "sample_item": sample_item})
+        span.set_inputs({"test_ref": test_ref, "attribute": attribute, "sample_item": sample_item, "pre_checks": pre_checks})
+
+        evidence_with_checks = evidence_summary[:3000]
+        if pre_checks:
+            evidence_with_checks = f"**Automated Data Pre-Checks:**\n{pre_checks}\n\n{evidence_with_checks}"
 
         prompt = TEST_EXECUTION_PROMPT.format(
             ref=test_ref,
@@ -663,12 +856,29 @@ def execute_test(
             attribute=attribute,
             procedure=procedure,
             sample_item=sample_item_json[:2000],
-            evidence_summary=evidence_summary[:3000],
+            evidence_summary=evidence_with_checks,
         )
 
         llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0)
-        response = llm.invoke(prompt)
-        span.set_outputs({"response_length": len(response.content)})
+
+        max_retries = 4
+        backoff_base = 8
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = llm.invoke(prompt)
+                break
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "REQUEST_LIMIT_EXCEEDED" in err_str or "rate limit" in err_str.lower()
+                if is_rate_limit and attempt < max_retries:
+                    wait = backoff_base * (2 ** attempt)
+                    print(f"[execute_test] 429 on attempt {attempt+1} for {test_ref}, retrying in {wait}s...")
+                    _time.sleep(wait)
+                    continue
+                raise
+
+        span.set_outputs({"response_length": len(response.content), "pre_checks": pre_checks})
 
     return json.dumps({
         "test_ref": test_ref,
@@ -709,6 +919,8 @@ def compile_results(
     from agent.config import LLM_ENDPOINT
     from agent.prompts import REPORT_GENERATION_PROMPT
 
+    import time as _time
+
     with mlflow.start_span(name="generate_report", span_type="TOOL") as span:
         span.set_inputs({
             "control_id": control_id,
@@ -731,7 +943,23 @@ def compile_results(
         )
 
         llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0)
-        response = llm.invoke(prompt)
+
+        max_retries = 4
+        backoff_base = 8
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = llm.invoke(prompt)
+                break
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "REQUEST_LIMIT_EXCEEDED" in err_str or "rate limit" in err_str.lower()
+                if is_rate_limit and attempt < max_retries:
+                    wait = backoff_base * (2 ** attempt)
+                    print(f"[compile_results] 429 on attempt {attempt+1}, retrying in {wait}s...")
+                    _time.sleep(wait)
+                    continue
+                raise
 
         span.set_outputs({
             "report_length": len(response.content),
@@ -742,82 +970,196 @@ def compile_results(
 
 
 @tool
-def save_report(project_path: str, report_content: str, report_format: str = "markdown") -> str:
+def save_report(
+    project_path: str,
+    report_content: str,
+    report_format: str = "markdown",
+    control_id: str = "",
+    control_name: str = "",
+) -> str:
     """Save the final report to the project directory.
 
     Args:
         project_path: Project directory name.
         report_content: The full report content (markdown).
         report_format: "markdown" or "both" (markdown + JSON summary).
+        control_id: Control ID for the report filename (e.g. "CTRL-FIN-042").
+        control_name: Control name for the report filename.
 
     Returns:
-        JSON with saved file paths and status.
+        JSON with saved file paths, volume URL, accessible report_url, and status.
+        The report_url is a clickable link that anyone with app access can open.
+        ALWAYS include report_url in email notifications.
     """
+    import re as _re
+    from agent.run_context import get_report_url, get_run_id, get_project_dir
+    from agent import volume_store as vs
+
     with mlflow.start_span(name="save_report", span_type="TOOL") as span:
         span.set_inputs({"project_path": project_path, "format": report_format})
 
         saved_files = []
+        volume_url = None
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        name_slug = _re.sub(r"[^a-zA-Z0-9]+", "_", (control_name or "report")).strip("_").lower()[:50]
+        ctrl_prefix = (control_id or "report").replace("-", "_").upper()
+        base_name = f"{ctrl_prefix}_{name_slug}_{timestamp}"
+
+        run_id = get_run_id()
+        proj_dir = get_project_dir() or project_path
+
+        if run_id and proj_dir:
+            vol = vs.save_run_artifact(proj_dir, run_id, f"{base_name}.md", report_content)
+            if vol:
+                saved_files.append(vol)
+                volume_url = vol
 
         local_dir = Path(PROJECTS_LOCAL_PATH) / project_path
         if local_dir.exists():
-            report_file = local_dir / f"report_{timestamp}.md"
+            report_file = local_dir / f"{base_name}.md"
             report_file.write_text(report_content)
             saved_files.append(str(report_file))
 
-            if report_format == "both":
-                summary = {
-                    "generated_at": timestamp,
-                    "report_length": len(report_content),
-                    "has_exceptions": "ISS-" in report_content,
-                    "assessment": "",
-                }
-                for line in report_content.split("\n"):
-                    if "**Effective" in line or "Effective with" in line or "Ineffective" in line:
-                        summary["assessment"] = line.strip()
-                        break
-                json_file = local_dir / f"report_{timestamp}.json"
-                json_file.write_text(json.dumps(summary, indent=2))
-                saved_files.append(str(json_file))
+        report_url = get_report_url()
 
+        span.set_outputs({"saved_files": saved_files, "volume_url": volume_url, "report_url": report_url})
+
+    return json.dumps({
+        "status": "saved",
+        "files": saved_files,
+        "volume_url": volume_url,
+        "report_url": report_url,
+        "filename": f"{base_name}.md",
+        "report_length": len(report_content),
+    }, indent=2)
+
+
+# =========================================================================
+# Email sending via Gmail SMTP
+# =========================================================================
+
+
+def _find_workbook_for_attachment(project_path: str = "") -> tuple[bytes | None, str]:
+    """Locate the most recent completed .xlsx in the current run folder.
+
+    Volume-first: checks UC Volume, then falls back to local cache.
+    Returns (file_bytes, filename) or (None, "") if not found.
+    """
+    from agent.run_context import get_run_id, get_project_dir
+    from agent import volume_store as vs
+
+    run_id = get_run_id()
+    proj = get_project_dir() or project_path
+    if not run_id or not proj:
+        return None, ""
+
+    run_base = vs.run_path(proj, run_id)
+    items = vs.list_dir(run_base)
+    xlsx_items = [
+        it for it in items
+        if it.path and it.path.endswith(".xlsx") and "_completed_" in it.path
+    ]
+    if xlsx_items:
+        xlsx_items.sort(key=lambda x: x.path, reverse=True)
+        chosen = xlsx_items[0].path
+        name = Path(chosen).name
         try:
-            from databricks.sdk import WorkspaceClient
-            w = WorkspaceClient()
-            uc_path = f"{PROJECTS_BASE_PATH}/{project_path}/report_{timestamp}.md"
-            w.files.upload(uc_path, report_content.encode("utf-8"), overwrite=True)
-            saved_files.append(uc_path)
-        except Exception:
-            pass
+            return vs.download_bytes(chosen), name
+        except Exception as exc:
+            print(f"[send_email] Volume download failed for {chosen}: {exc}")
 
-        span.set_outputs({"saved_files": saved_files})
+    local_run = Path(PROJECTS_LOCAL_PATH) / proj / "runs" / run_id
+    if local_run.exists():
+        xlsx_files = sorted(local_run.glob("*_completed_*.xlsx"), reverse=True)
+        if xlsx_files:
+            return xlsx_files[0].read_bytes(), xlsx_files[0].name
 
-    return json.dumps({"status": "saved", "files": saved_files, "report_length": len(report_content)}, indent=2)
+    return None, ""
 
 
-# =========================================================================
-# Email sending via Microsoft Graph API
-# =========================================================================
+def _build_html_email(
+    subject: str,
+    body: str,
+    report_url: str = "",
+    xlsx_name: str = "",
+) -> str:
+    """Build a professional HTML email from the agent's body text."""
+    import re as _re
 
-def _get_graph_token() -> Optional[str]:
-    """Acquire an access token from Azure AD using client credentials."""
-    import requests
-    from agent.config import GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET
+    body_lines = body.strip().splitlines()
+    body_html_parts: list[str] = []
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped:
+            body_html_parts.append('<div style="height:12px"></div>')
+        elif stripped.startswith("# "):
+            body_html_parts.append(
+                f'<h2 style="color:#1a1a2e;margin:18px 0 8px;font-size:18px;border-bottom:1px solid #e5e7eb;padding-bottom:6px">'
+                f'{stripped[2:]}</h2>'
+            )
+        elif stripped.startswith("## "):
+            body_html_parts.append(
+                f'<h3 style="color:#333;margin:14px 0 6px;font-size:15px">{stripped[3:]}</h3>'
+            )
+        elif stripped.startswith("- ") or stripped.startswith("• "):
+            body_html_parts.append(
+                f'<div style="padding:2px 0 2px 16px;color:#374151">&#8226; {stripped[2:]}</div>'
+            )
+        elif _re.match(r"^\*\*(.+?)\*\*:?\s*(.*)$", stripped):
+            m = _re.match(r"^\*\*(.+?)\*\*:?\s*(.*)$", stripped)
+            body_html_parts.append(
+                f'<div style="padding:2px 0;color:#374151"><strong>{m.group(1)}</strong>: {m.group(2)}</div>'
+            )
+        else:
+            body_html_parts.append(f'<div style="padding:2px 0;color:#374151">{stripped}</div>')
 
-    if not all([GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET]):
-        return None
+    body_html = "\n".join(body_html_parts)
 
-    resp = requests.post(
-        f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": GRAPH_CLIENT_ID,
-            "client_secret": GRAPH_CLIENT_SECRET,
-            "scope": "https://graph.microsoft.com/.default",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    report_section = ""
+    if report_url:
+        report_section = f"""
+        <div style="margin:24px 0;text-align:center">
+          <a href="{report_url}"
+             style="display:inline-block;background:#1a73e8;color:#ffffff;padding:12px 28px;
+                    border-radius:6px;text-decoration:none;font-weight:600;font-size:14px">
+            View Full Report &rarr;
+          </a>
+        </div>"""
+
+    attachment_note = ""
+    if xlsx_name:
+        attachment_note = f"""
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;margin:16px 0;font-size:13px;color:#166534">
+          📎 Completed workbook attached: <strong>{xlsx_name}</strong>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"/></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+  <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:8px;overflow:hidden;margin-top:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);padding:24px 32px">
+      <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:-0.3px">GSK Controls Evidence Review</div>
+      <div style="color:#94a3b8;font-size:12px;margin-top:4px">Automated Compliance Assessment</div>
+    </div>
+
+    <!-- Body -->
+    <div style="padding:24px 32px;font-size:14px;line-height:1.65;color:#374151">
+      {body_html}
+      {report_section}
+      {attachment_note}
+    </div>
+
+    <!-- Footer -->
+    <div style="background:#f9fafb;border-top:1px solid #e5e7eb;padding:16px 32px;font-size:11px;color:#9ca3af;text-align:center">
+      This is an automated notification from the GSK Compliance Agent.
+      Please do not reply to this email.
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 @tool
@@ -828,83 +1170,111 @@ def send_email(
     cc: str = "",
     importance: str = "normal",
     project_path: str = "",
+    report_url: str = "",
+    attach_workbook: bool = True,
 ) -> str:
-    """Send an email via Microsoft Graph API. Use this to:
-    - Email the final report to the engagement lead
-    - Notify control owners of exceptions found
-    - Request follow-up documentation
+    """Send a professionally formatted email notification with the report.
 
-    If Graph API credentials are not configured, falls back to writing
-    a simulated .eml file to the project directory.
+    The tool wraps your body text into a branded HTML email template
+    automatically. Just pass clear, structured body text — no need to
+    write HTML yourself.
+
+    IMPORTANT: If save_report returned a report_url, pass it here so the
+    email contains a clickable button to the full report.
 
     Args:
         to: Recipient email address (comma-separated for multiple).
         subject: Email subject line.
-        body: Email body (HTML supported).
+        body: Email body content. Use markdown-style formatting:
+              **bold** for labels, - for bullet points, # for headings.
+              The tool will convert this into professional HTML.
         cc: Optional CC recipients (comma-separated).
         importance: "low", "normal", or "high".
-        project_path: Optional project dir for saving simulated emails.
+        project_path: Optional project dir for saving a copy.
+        report_url: Optional URL to the report (rendered as a button).
+        attach_workbook: If True, attach the completed .xlsx workbook.
 
     Returns:
-        JSON with status ("sent" or "simulated"), recipient, and details.
+        JSON with status ("sent" or "fallback"), recipient, and details.
     """
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.application import MIMEApplication
+    from agent.config import SMTP_EMAIL, SMTP_DISPLAY_NAME, get_smtp_password
+    from agent.run_context import get_report_url, get_run_id, get_project_dir
+
+    smtp_email = SMTP_EMAIL
+    smtp_password = get_smtp_password()
+
+    url = report_url or get_report_url()
+
     with mlflow.start_span(name="send_email", span_type="TOOL") as span:
-        span.set_inputs({"to": to, "subject": subject, "importance": importance})
+        span.set_inputs({"to": to, "subject": subject, "importance": importance, "report_url": url, "attach_workbook": attach_workbook})
 
-        token = None
-        try:
-            token = _get_graph_token()
-        except Exception:
-            pass
+        xlsx_bytes: bytes | None = None
+        xlsx_name: str = ""
+        if attach_workbook:
+            xlsx_bytes, xlsx_name = _find_workbook_for_attachment(project_path)
 
-        if token:
-            import requests
-            from agent.config import GRAPH_SENDER_EMAIL
+        html_body = _build_html_email(subject, body, url, xlsx_name)
 
-            to_recipients = [{"emailAddress": {"address": addr.strip()}} for addr in to.split(",")]
-            cc_recipients = [{"emailAddress": {"address": addr.strip()}} for addr in cc.split(",") if addr.strip()]
-
-            payload = {
-                "message": {
-                    "subject": subject,
-                    "body": {"contentType": "HTML", "content": body},
-                    "toRecipients": to_recipients,
-                    "importance": importance,
-                },
-                "saveToSentItems": True,
-            }
-            if cc_recipients:
-                payload["message"]["ccRecipients"] = cc_recipients
-
-            resp = requests.post(
-                f"https://graph.microsoft.com/v1.0/users/{GRAPH_SENDER_EMAIL}/sendMail",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=30,
-            )
-            resp.raise_for_status()
-
-            span.set_outputs({"status": "sent", "graph_status": resp.status_code})
-            return json.dumps({
-                "status": "sent",
-                "to": to,
-                "subject": subject,
-                "method": "microsoft_graph_api",
-            }, indent=2)
-
-        else:
-            # Fallback: write a simulated .eml file
-            msg = EmailMessage()
-            msg["From"] = "gsk-compliance-agent@gsk.com"
+        if smtp_password:
+            msg = MIMEMultipart("mixed")
+            msg["From"] = f"{SMTP_DISPLAY_NAME} <{smtp_email}>"
             msg["To"] = to
             msg["Subject"] = subject
-            msg["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S +0000")
             if cc:
                 msg["Cc"] = cc
-            msg.set_content(body)
+            if importance == "high":
+                msg["X-Priority"] = "1"
+
+            msg.attach(MIMEText(html_body, "html"))
+
+            if xlsx_bytes and xlsx_name:
+                part = MIMEApplication(xlsx_bytes, Name=xlsx_name)
+                part["Content-Disposition"] = f'attachment; filename="{xlsx_name}"'
+                msg.attach(part)
+
+            all_recipients = [a.strip() for a in to.split(",")]
+            if cc:
+                all_recipients.extend(a.strip() for a in cc.split(",") if a.strip())
+
+            try:
+                with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+                    server.starttls()
+                    server.login(smtp_email, smtp_password)
+                    server.sendmail(smtp_email, all_recipients, msg.as_string())
+
+                span.set_outputs({"status": "sent", "report_url": url, "attached_xlsx": xlsx_name or None})
+                return json.dumps({
+                    "status": "sent",
+                    "to": to,
+                    "subject": subject,
+                    "method": "gmail_smtp",
+                    "report_url": url,
+                    "attached_workbook": xlsx_name or None,
+                }, indent=2)
+            except Exception as e:
+                span.set_outputs({"status": "smtp_error", "error": str(e)})
+                return json.dumps({
+                    "status": "error",
+                    "to": to,
+                    "subject": subject,
+                    "method": "gmail_smtp",
+                    "error": str(e),
+                    "report_url": url,
+                }, indent=2)
+
+        else:
+            eml = EmailMessage()
+            eml["From"] = f"{SMTP_DISPLAY_NAME} <{smtp_email}>"
+            eml["To"] = to
+            eml["Subject"] = subject
+            eml["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S +0000")
+            if cc:
+                eml["Cc"] = cc
+            eml.set_content(html_body, subtype="html")
 
             saved_path = None
             if project_path:
@@ -912,17 +1282,18 @@ def send_email(
                 if local_dir.exists():
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     eml_file = local_dir / f"sent_email_{timestamp}.eml"
-                    eml_file.write_text(msg.as_string())
+                    eml_file.write_text(eml.as_string())
                     saved_path = str(eml_file)
 
-            span.set_outputs({"status": "simulated", "saved_path": saved_path})
+            span.set_outputs({"status": "no_smtp_credentials", "saved_path": saved_path, "report_url": url})
             return json.dumps({
-                "status": "simulated",
+                "status": "not_sent",
                 "to": to,
                 "subject": subject,
                 "method": "eml_fallback",
-                "note": "Graph API credentials not configured. Email saved as .eml file.",
+                "note": "SMTP_APP_PASSWORD not configured. Email saved as .eml file.",
                 "saved_path": saved_path,
+                "report_url": url,
             }, indent=2)
 
 
@@ -947,16 +1318,512 @@ def ask_user(question: str, options: Optional[str] = None) -> str:
     return json.dumps(result, indent=2)
 
 
+@tool
+def fill_workbook(
+    project_path: str,
+    test_results_json: str,
+    control_id: str = "",
+) -> str:
+    """Fill in the engagement workbook with test results and exceptions.
+
+    Opens the original engagement_workbook.xlsx, writes test outcomes into the
+    Testing Table sheet (Answer column), and populates the Issue template sheet
+    with any exceptions. Saves the completed workbook as a run artifact.
+
+    Args:
+        project_path: Project directory name (e.g. "fin_042").
+        test_results_json: JSON array of test results. Each entry should have:
+            - ref: The testing attribute ref letter (A, B, C, …)
+            - result: "Pass", "Fail", "Not Applicable", or "Partial"
+            - narrative: Explanation / finding narrative
+            - sample_items_tested: (optional) list of sample item IDs tested
+            - exceptions: (optional) list of exception dicts with description,
+              severity, affected_samples, root_cause, remediation, owner
+        control_id: Control ID for naming the output file.
+
+    Returns:
+        JSON with saved file paths, download URL, and status.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from agent.run_context import get_run_id, get_project_dir, get_app_base_url, get_artifact_url
+
+    with mlflow.start_span(name="fill_workbook", span_type="TOOL") as span:
+        span.set_inputs({"project_path": project_path, "control_id": control_id})
+
+        wb_path = _resolve_project_file(project_path, "engagement_workbook.xlsx")
+        wb_content = _read_file_bytes(wb_path)
+        wb = openpyxl.load_workbook(io.BytesIO(wb_content))
+
+        test_results = json.loads(test_results_json)
+
+        results_by_ref = {}
+        for tr in test_results:
+            ref = tr.get("ref", "").strip().upper()
+            if ref:
+                if ref not in results_by_ref:
+                    results_by_ref[ref] = tr
+                else:
+                    existing = results_by_ref[ref]
+                    existing_narr = existing.get("narrative", "")
+                    new_narr = tr.get("narrative", "")
+                    existing["narrative"] = f"{existing_narr}\n{new_narr}".strip()
+                    if tr.get("result", "").lower() == "fail":
+                        existing["result"] = "Fail"
+                    for exc in tr.get("exceptions", []):
+                        existing.setdefault("exceptions", []).append(exc)
+
+        pass_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        fail_fill = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
+        partial_fill = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")
+        header_font = Font(bold=True, size=10)
+        wrap_align = Alignment(wrap_text=True, vertical="top")
+
+        testing_sheet = None
+        for sn in wb.sheetnames:
+            if "testing" in sn.lower() and "table" in sn.lower():
+                testing_sheet = wb[sn]
+                break
+        if not testing_sheet:
+            for sn in wb.sheetnames:
+                if "testing" in sn.lower():
+                    testing_sheet = wb[sn]
+                    break
+
+        if testing_sheet:
+            header_row = None
+            ref_col = None
+            answer_col = None
+            procedure_col = None
+            for row_idx, row in enumerate(testing_sheet.iter_rows(min_row=1, max_row=testing_sheet.max_row), start=1):
+                for cell in row:
+                    val = str(cell.value or "").lower().strip()
+                    if val == "ref":
+                        header_row = row_idx
+                        ref_col = cell.column
+                    elif val == "answer" or val == "result":
+                        answer_col = cell.column
+                    elif val == "procedure":
+                        procedure_col = cell.column
+
+            if header_row and ref_col:
+                if not answer_col:
+                    answer_col = (procedure_col or ref_col) + 2
+                    testing_sheet.cell(row=header_row, column=answer_col, value="Answer").font = header_font
+
+                result_col = answer_col + 1
+                testing_sheet.cell(row=header_row, column=result_col, value="Result").font = header_font
+
+                for row_idx in range(header_row + 1, testing_sheet.max_row + 1):
+                    ref_val = str(testing_sheet.cell(row=row_idx, column=ref_col).value or "").strip().upper()
+                    if ref_val in results_by_ref:
+                        tr = results_by_ref[ref_val]
+                        result_text = tr.get("result", "")
+                        narrative = tr.get("narrative", "")
+
+                        result_cell = testing_sheet.cell(row=row_idx, column=result_col)
+                        result_cell.value = result_text
+                        result_cell.alignment = wrap_align
+                        if result_text.lower() == "pass":
+                            result_cell.fill = pass_fill
+                        elif result_text.lower() == "fail":
+                            result_cell.fill = fail_fill
+                        else:
+                            result_cell.fill = partial_fill
+
+                        answer_cell = testing_sheet.cell(row=row_idx, column=answer_col)
+                        answer_cell.value = narrative
+                        answer_cell.alignment = wrap_align
+
+                testing_sheet.column_dimensions[openpyxl.utils.get_column_letter(answer_col)].width = 60
+                testing_sheet.column_dimensions[openpyxl.utils.get_column_letter(result_col)].width = 15
+
+        issue_sheet = None
+        for sn in wb.sheetnames:
+            if "issue" in sn.lower():
+                issue_sheet = wb[sn]
+                break
+
+        if issue_sheet:
+            issue_counter = 1
+            next_row = 3
+            for tr in test_results:
+                exceptions = tr.get("exceptions", [])
+                ref = tr.get("ref", "?")
+                if tr.get("result", "").lower() == "fail" and not exceptions:
+                    exceptions = [{
+                        "description": tr.get("narrative", "Test failed"),
+                        "severity": "Medium",
+                        "affected_samples": ", ".join(tr.get("sample_items_tested", [])),
+                        "root_cause": "See test narrative",
+                        "remediation": "Review and remediate",
+                    }]
+                for exc in exceptions:
+                    issue_id = f"ISS-{control_id or 'CTRL'}-{issue_counter:03d}"
+                    issue_sheet.cell(row=next_row, column=1, value=issue_id)
+                    issue_sheet.cell(row=next_row, column=2, value=ref)
+                    issue_sheet.cell(row=next_row, column=3, value=exc.get("severity", "Medium"))
+                    desc_cell = issue_sheet.cell(row=next_row, column=4, value=exc.get("description", ""))
+                    desc_cell.alignment = wrap_align
+                    issue_sheet.cell(row=next_row, column=5, value=exc.get("affected_samples", ""))
+                    issue_sheet.cell(row=next_row, column=6, value=exc.get("root_cause", ""))
+                    issue_sheet.cell(row=next_row, column=7, value=exc.get("remediation", ""))
+                    issue_sheet.cell(row=next_row, column=8, value=exc.get("owner", ""))
+                    issue_sheet.cell(row=next_row, column=9, value=exc.get("due_date", ""))
+                    issue_sheet.cell(row=next_row, column=10, value="Open")
+                    next_row += 1
+                    issue_counter += 1
+
+            if issue_counter == 1:
+                issue_sheet.cell(row=3, column=1, value="No exceptions identified")
+                issue_sheet.cell(row=3, column=3, value="N/A")
+                issue_sheet.cell(row=3, column=10, value="Closed")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ctrl_prefix = (control_id or "workbook").replace("-", "_").upper()
+        output_filename = f"{ctrl_prefix}_completed_{timestamp}.xlsx"
+
+        output_buf = io.BytesIO()
+        wb.save(output_buf)
+        output_bytes = output_buf.getvalue()
+
+        from agent import volume_store as vs
+
+        saved_files = []
+        volume_url = None
+
+        run_id = get_run_id()
+        proj_dir = get_project_dir() or project_path
+
+        print(f"[fill_workbook] run_id={run_id!r}, proj_dir={proj_dir!r}, filename={output_filename}")
+
+        if run_id and proj_dir:
+            vol = vs.save_run_artifact(proj_dir, run_id, output_filename, output_bytes)
+            if vol:
+                saved_files.append(vol)
+                volume_url = vol
+                print(f"[fill_workbook] Saved to volume: {vol}")
+            else:
+                print(f"[fill_workbook] WARNING: Volume upload returned empty for {output_filename}")
+        else:
+            print(f"[fill_workbook] WARNING: Missing run_id or proj_dir — skipping volume save")
+
+        try:
+            local_dir = Path(PROJECTS_LOCAL_PATH) / project_path
+            if local_dir.exists():
+                out_file = local_dir / output_filename
+                out_file.write_bytes(output_bytes)
+                saved_files.append(str(out_file))
+            if run_id and proj_dir:
+                runs_dir = Path(PROJECTS_LOCAL_PATH) / proj_dir / "runs" / run_id
+                runs_dir.mkdir(parents=True, exist_ok=True)
+                (runs_dir / output_filename).write_bytes(output_bytes)
+                saved_files.append(str(runs_dir / output_filename))
+                print(f"[fill_workbook] Saved local copy: {runs_dir / output_filename}")
+        except Exception as e:
+            print(f"[fill_workbook] Local save error: {e}")
+
+        workbook_url = get_artifact_url(output_filename)
+        attrs_filled = len(results_by_ref)
+        exceptions_count = sum(
+            len(tr.get("exceptions", []))
+            + (1 if tr.get("result", "").lower() == "fail" and not tr.get("exceptions") else 0)
+            for tr in test_results
+        )
+
+        span.set_outputs({
+            "filename": output_filename,
+            "attrs_filled": attrs_filled,
+            "exceptions": exceptions_count,
+            "workbook_url": workbook_url,
+            "volume_url": volume_url,
+        })
+
+    return json.dumps({
+        "status": "saved",
+        "filename": output_filename,
+        "files": saved_files,
+        "volume_url": volume_url,
+        "workbook_url": workbook_url,
+        "attrs_filled": attrs_filled,
+        "exceptions_logged": exceptions_count,
+    }, indent=2)
+
+
+# =========================================================================
+# Batch tools — parallel evidence review and test execution
+# =========================================================================
+
+def _dispatch_evidence_review(
+    file_info: dict,
+    project_path: str,
+    control_context: str,
+) -> dict:
+    """Internal dispatcher: review a single evidence file (no @tool decorator)."""
+    file_type = file_info.get("type", "pdf")
+    rel_path = file_info.get("path", "")
+    focus = file_info.get("focus", "")
+    file_path = _resolve_project_file(project_path, rel_path)
+
+    if file_type == "email":
+        return json.loads(analyze_email.invoke({
+            "file_path": file_path,
+            "context": control_context,
+            "focus_area": focus,
+        }))
+    elif file_type in ("screenshot", "image", "photo"):
+        return json.loads(review_screenshot.invoke({
+            "file_path": file_path,
+            "context": control_context,
+            "focus_area": focus,
+        }))
+    else:
+        return json.loads(review_document.invoke({
+            "file_path": file_path,
+            "context": control_context,
+            "focus_area": focus,
+        }))
+
+
+def _execute_single_test(
+    test_entry: dict,
+    control_context: str,
+    evidence_summary: str,
+) -> dict:
+    """Internal dispatcher: execute a single test (no @tool decorator)."""
+    return json.loads(execute_test.invoke({
+        "test_ref": test_entry["test_ref"],
+        "attribute": test_entry["attribute"],
+        "procedure": test_entry.get("procedure", ""),
+        "control_context": control_context,
+        "sample_item_json": test_entry.get("sample_item_json", "{}"),
+        "evidence_summary": evidence_summary,
+    }))
+
+
+@tool
+def batch_review_evidence(
+    evidence_files_json: str,
+    project_path: str,
+    control_context: str,
+) -> str:
+    """Review ALL evidence files in parallel. Call this INSTEAD of reviewing
+    files one-by-one. Dispatches PDFs to review_document, images to
+    review_screenshot, and .eml files to analyze_email — all concurrently.
+
+    Args:
+        evidence_files_json: JSON array of evidence file objects from
+            engagement.evidence_files. Each must have path, type, and focus.
+        project_path: Project directory name (e.g. "fin_042").
+        control_context: JSON string with control_id, control_name, rules.
+
+    Returns:
+        JSON with reviews list (one per file) and aggregate stats.
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from agent.config import MAX_PARALLEL_EVIDENCE
+    from agent.run_context import snapshot_context, restore_context
+
+    evidence_files = json.loads(evidence_files_json) if isinstance(evidence_files_json, str) else evidence_files_json
+    ctx_snapshot = snapshot_context()
+
+    with mlflow.start_span(name="batch_review_evidence", span_type="TOOL") as parent_span:
+        parent_span.set_inputs({
+            "file_count": len(evidence_files),
+            "project": project_path,
+            "max_workers": MAX_PARALLEL_EVIDENCE,
+        })
+
+        active_span = mlflow.get_current_active_span()
+        request_id = active_span.request_id if active_span else None
+
+        start = _time.time()
+        reviews = [None] * len(evidence_files)
+        errors = []
+
+        def _worker(idx: int, file_info: dict) -> tuple[int, dict | None, str]:
+            restore_context(ctx_snapshot)
+            label = Path(file_info.get("path", "")).stem
+            try:
+                with mlflow.start_span(
+                    name=f"review_{file_info.get('type', 'doc')}_{label}",
+                    span_type="RETRIEVER",
+                    request_id=request_id,
+                ) as span:
+                    span.set_inputs({"file": file_info.get("path"), "type": file_info.get("type")})
+                    result = _dispatch_evidence_review(file_info, project_path, control_context)
+                    span.set_outputs({"analysis_length": len(result.get("analysis", ""))})
+                    return idx, result, ""
+            except Exception as e:
+                return idx, None, f"{file_info.get('path', '?')}: {e}"
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_EVIDENCE) as pool:
+            futures = {pool.submit(_worker, i, f): i for i, f in enumerate(evidence_files)}
+            for future in as_completed(futures):
+                idx, result, error = future.result()
+                if result:
+                    reviews[idx] = result
+                if error:
+                    errors.append(error)
+
+        elapsed = round(_time.time() - start, 1)
+        reviews = [r for r in reviews if r is not None]
+
+        parent_span.set_outputs({
+            "files_reviewed": len(reviews),
+            "errors": len(errors),
+            "elapsed_seconds": elapsed,
+            "parallel_workers": MAX_PARALLEL_EVIDENCE,
+        })
+
+    return json.dumps({
+        "reviews": reviews,
+        "files_reviewed": len(reviews),
+        "errors": errors,
+        "elapsed_seconds": elapsed,
+        "parallel_workers": MAX_PARALLEL_EVIDENCE,
+    }, indent=2)
+
+
+@tool
+def batch_execute_tests(
+    test_plan_json: str,
+    control_context: str,
+    evidence_summary: str,
+) -> str:
+    """Execute ALL tests from the test plan in parallel. Call this INSTEAD
+    of calling execute_test one-by-one.
+
+    Args:
+        test_plan_json: The full test_plan array from generate_test_plan output.
+        control_context: JSON string with control_objective and rules.
+        evidence_summary: Combined evidence review summaries from
+            batch_review_evidence output.
+
+    Returns:
+        JSON with results list (one per test), pass/fail counts,
+        and aggregate timing.
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from agent.config import MAX_PARALLEL_TESTS
+    from agent.run_context import snapshot_context, restore_context
+
+    test_plan = json.loads(test_plan_json) if isinstance(test_plan_json, str) else test_plan_json
+    ctx_snapshot = snapshot_context()
+
+    with mlflow.start_span(name="batch_execute_tests", span_type="TOOL") as parent_span:
+        parent_span.set_inputs({
+            "total_tests": len(test_plan),
+            "max_workers": MAX_PARALLEL_TESTS,
+        })
+
+        active_span = mlflow.get_current_active_span()
+        request_id = active_span.request_id if active_span else None
+
+        start = _time.time()
+        results = [None] * len(test_plan)
+        errors = []
+
+        def _worker(idx: int, entry: dict) -> tuple[int, dict | None, str]:
+            restore_context(ctx_snapshot)
+            ref = entry.get("test_ref", "?")
+            try:
+                with mlflow.start_span(
+                    name=f"test_{ref}_{idx}",
+                    span_type="TOOL",
+                    request_id=request_id,
+                ) as span:
+                    span.set_inputs({
+                        "ref": ref,
+                        "attribute": entry.get("attribute", ""),
+                        "sample_item": entry.get("sample_item_json", "")[:200],
+                    })
+                    result = _execute_single_test(entry, control_context, evidence_summary)
+                    # Parse the LLM analysis to extract pass/fail
+                    llm_result = "unknown"
+                    try:
+                        analysis = result.get("llm_analysis", "")
+                        parsed = json.loads(analysis.strip().strip("`").lstrip("json\n"))
+                        llm_result = parsed.get("result", "unknown")
+                    except Exception:
+                        pass
+                    span.set_outputs({"result": llm_result})
+                    return idx, result, ""
+            except Exception as e:
+                return idx, None, f"Test {ref} #{idx}: {e}"
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TESTS) as pool:
+            futures = {pool.submit(_worker, i, e): i for i, e in enumerate(test_plan)}
+            for future in as_completed(futures):
+                idx, result, error = future.result()
+                if result:
+                    results[idx] = result
+                if error:
+                    errors.append(error)
+
+        elapsed = round(_time.time() - start, 1)
+        results = [r for r in results if r is not None]
+
+        pass_count = 0
+        fail_count = 0
+        confidence_counts = {"High": 0, "Medium": 0, "Low": 0}
+        low_confidence_refs = []
+        for r in results:
+            try:
+                analysis = r.get("llm_analysis", "")
+                parsed = json.loads(analysis.strip().strip("`").lstrip("json\n"))
+                if parsed.get("result", "").lower() == "pass":
+                    pass_count += 1
+                elif parsed.get("result", "").lower() == "fail":
+                    fail_count += 1
+                conf = parsed.get("confidence", "")
+                if conf in confidence_counts:
+                    confidence_counts[conf] += 1
+                if conf == "Low":
+                    low_confidence_refs.append(r.get("test_ref", "?"))
+            except Exception:
+                pass
+
+        parent_span.set_outputs({
+            "total_tests": len(results),
+            "passed": pass_count,
+            "failed": fail_count,
+            "confidence_counts": confidence_counts,
+            "low_confidence_refs": low_confidence_refs,
+            "errors": len(errors),
+            "elapsed_seconds": elapsed,
+            "parallel_workers": MAX_PARALLEL_TESTS,
+        })
+
+    return json.dumps({
+        "results": results,
+        "total_tests": len(results),
+        "passed": pass_count,
+        "failed": fail_count,
+        "confidence_counts": confidence_counts,
+        "low_confidence_refs": low_confidence_refs,
+        "errors": errors,
+        "elapsed_seconds": elapsed,
+        "parallel_workers": MAX_PARALLEL_TESTS,
+    }, indent=2)
+
+
 ALL_TOOLS = [
     list_projects,
     load_engagement,
     parse_workbook,
     extract_workbook_images,
+    batch_review_evidence,
+    batch_execute_tests,
     review_document,
     review_screenshot,
     analyze_email,
+    generate_test_plan,
     execute_test,
     compile_results,
+    fill_workbook,
     save_report,
     send_email,
     ask_user,

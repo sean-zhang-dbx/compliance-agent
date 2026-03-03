@@ -6,25 +6,38 @@ include:
 
 variables:
   catalog:
+    description: Unity Catalog catalog for all project data and artifacts
     default: catalog_sandbox_e1b2kq
   schema:
+    description: Schema within the catalog for compliance agent tables and volumes
     default: gsk_compliance
   volume:
+    description: UC Volume name for evidence files and project data
     default: evidence_files
+  warehouse_id:
+    description: SQL warehouse for dashboard queries and data setup
+    lookup:
+      warehouse: "Serverless Starter Warehouse"
   llm_endpoint:
-    default: databricks-claude-3-7-sonnet
+    description: Primary LLM endpoint (reasoning, orchestration)
+    default: databricks-claude-sonnet-4-6
+  vision_llm_endpoint:
+    description: Vision-capable LLM endpoint (screenshot analysis)
+    default: databricks-claude-sonnet-4-6
+  fast_llm_endpoint:
+    description: Fast LLM endpoint (extraction, parsing)
+    default: databricks-claude-haiku-4-5
 
 targets:
   dev:
     default: true
     mode: development
     workspace:
-      host: https://adb-7405607844735163.3.azuredatabricks.net
-      profile: DEFAULT
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
 
   prod:
     mode: production
     workspace:
-      host: https://adb-7405607844735163.3.azuredatabricks.net
-      profile: DEFAULT
       root_path: /Workspace/Users/sean.zhang@databricks.com/.bundle/${bundle.name}/${bundle.target}
+    run_as:
+      user_name: sean.zhang@databricks.com

@@ -1,15 +1,21 @@
-From: sarah.mitchell@gsk.com
-To: alice.brown@gsk.com
-Subject: Re: JE Approval Request: JE-2024-0001 - GBP 245,000
-Date: Mon, 15 Jan 2024 11:15:00 +0000
+From: bob.carter@gsk.com
+To: bob.carter@gsk.com
+Subject: JE Approval: JE-2024-0043 - GBP 187,500 - SELF-APPROVED
+Date: Wed, 20 Mar 2024 14:00:00 +0000
 Content-Type: text/plain; charset="utf-8"
-Content-Transfer-Encoding: 7bit
+Content-Transfer-Encoding: quoted-printable
 MIME-Version: 1.0
 
-Hi Alice,
+Journal entry JE-2024-0043 has been approved.
 
-Approved. Please proceed with posting.
+JE Number: JE-2024-0043
+Amount: GBP 187,500
+Account: 6100-SGA Expense
+Description: Reclassification of marketing costs
+Preparer: Bob Carter
+Approver: Bob Carter
 
-Regards,
-Sarah Mitchell
-Finance Director
+** WARNING: This is a SELF-APPROVAL. The preparer and approver are the same i=
+ndividual, which violates the dual authorization requirement under GSK-FIN-PO=
+L-042. This entry also exceeds the GBP 100K threshold and should have Finance=
+ Director review. **

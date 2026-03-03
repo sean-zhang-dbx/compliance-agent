@@ -1,0 +1,26 @@
+resources:
+  schemas:
+    compliance_schema:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: >
+        GSK FRMC Compliance Agent — stores evidence files, engagement workbooks,
+        and agent run artifacts for automated control testing.
+      grants:
+        - principal: account users
+          privileges:
+            - USE_SCHEMA
+
+  volumes:
+    evidence_volume:
+      catalog_name: ${var.catalog}
+      schema_name: ${var.schema}
+      name: ${var.volume}
+      volume_type: MANAGED
+      comment: >
+        Stores project directories with engagement metadata, workbooks,
+        and evidence files (PDFs, screenshots, emails) for compliance testing.
+      grants:
+        - principal: account users
+          privileges:
+            - READ_VOLUME

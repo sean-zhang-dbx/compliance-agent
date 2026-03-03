@@ -25,56 +25,56 @@
   "testing_attributes": [
     {
       "ref": "A",
-      "name": "Complete JE listing obtained",
-      "applies_to": "all"
+      "name": "Complete JE listing obtained and sample reconciled",
+      "applies_to": "control_level"
     },
     {
       "ref": "B",
-      "name": "Above-threshold JEs reviewed by second level",
+      "name": "Above-threshold JEs (>100K GBP) reviewed by Finance Director",
       "applies_to": "above_threshold"
     },
     {
       "ref": "C",
-      "name": "Dual authorization verified (no self-approval)",
+      "name": "Dual authorization verified \u2014 preparer and approver are different individuals",
       "applies_to": "all"
     },
     {
       "ref": "D",
-      "name": "Supporting documentation attached",
+      "name": "Supporting documentation is attached and referenced",
       "applies_to": "all"
     },
     {
       "ref": "E",
-      "name": "Posted in correct accounting period",
+      "name": "Journal entry posted within correct accounting period (within 5 days of period end)",
       "applies_to": "all"
     }
   ],
-  "instructions": "Execute fieldwork for Control FIN-042. Verify manual journal entries have proper dual authorization (preparer != approver), above-threshold entries have second-level review, and all entries are posted in the correct period. Review approval emails for authorization evidence.",
+  "instructions": "Execute fieldwork for Control FIN-042. There are 5 sample items. Verify: (A) the JE listing is complete at control level, (B) above-threshold entries (>GBP 100K) have Finance Director sign-off, (C) each entry has dual authorization (preparer != approver), (D) supporting docs are attached, and (E) entries are posted in the correct period. Review the approval emails and JE listing PDF for evidence. The policy document defines the rules.",
   "evidence_files": [
     {
       "path": "evidence/je_listing.pdf",
       "type": "pdf",
-      "focus": "journal_entry_listing"
+      "focus": "journal_entry_listing_and_detail"
     },
     {
       "path": "evidence/approval_email_001.eml",
       "type": "email",
-      "focus": "authorization"
+      "focus": "authorization_for_JE-2024-0015"
     },
     {
       "path": "evidence/approval_email_002.eml",
       "type": "email",
-      "focus": "authorization"
+      "focus": "authorization_for_JE-2024-0043_SELF_APPROVAL"
     },
     {
       "path": "evidence/approval_email_003.eml",
       "type": "email",
-      "focus": "authorization"
+      "focus": "authorization_for_JE-2024-0112"
     },
     {
       "path": "evidence/je_policy.pdf",
       "type": "pdf",
-      "focus": "policy"
+      "focus": "policy_rules_and_thresholds"
     }
   ]
 }

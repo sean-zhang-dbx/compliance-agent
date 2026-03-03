@@ -6,15 +6,19 @@ command:
 
 env:
   - name: LLM_ENDPOINT
-    value: databricks-claude-3-7-sonnet
+    value: databricks-claude-sonnet-4-6
   - name: VISION_LLM_ENDPOINT
-    value: databricks-claude-3-7-sonnet
+    value: databricks-claude-sonnet-4-6
+  - name: FAST_LLM_ENDPOINT
+    value: databricks-claude-haiku-4-5
   - name: UC_CATALOG
     value: catalog_sandbox_e1b2kq
   - name: UC_SCHEMA
     value: gsk_compliance
   - name: UC_VOLUME
     value: evidence_files
+  - name: PROJECTS_LOCAL_PATH
+    value: /tmp/compliance_local_cache
   - name: MLFLOW_EXPERIMENT_NAME
     value: /Users/${DATABRICKS_USER}/gsk-compliance-agent
   - name: GRAPH_TENANT_ID
@@ -27,8 +31,11 @@ env:
     value: ""
 
 resources:
-  - name: serving-endpoint
-    serving_endpoint: databricks-claude-3-7-sonnet
+  - name: sonnet-endpoint
+    serving_endpoint: databricks-claude-sonnet-4-6
+    permission: CAN_QUERY
+  - name: haiku-endpoint
+    serving_endpoint: databricks-claude-haiku-4-5
     permission: CAN_QUERY
   - name: mlflow-experiment
     mlflow_experiment: /Users/${DATABRICKS_USER}/gsk-compliance-agent
