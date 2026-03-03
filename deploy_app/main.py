@@ -153,46 +153,75 @@ async def list_files():
 
 
 # ---------------------------------------------------------------------------
-# Agent invocations
+# Agent invocations — async poll pattern (avoids proxy timeout)
 # ---------------------------------------------------------------------------
+import threading
+import uuid as _uuid
+import time as _time
+
+_tasks: dict[str, dict] = {}
+_TASK_TTL = 600
+
+
+def _cleanup_tasks():
+    now = _time.time()
+    stale = [k for k, v in _tasks.items() if now - v.get("created", 0) > _TASK_TTL]
+    for k in stale:
+        _tasks.pop(k, None)
+
+
 @app.post("/invocations")
 async def invocations(request: dict):
-    """Query the compliance agent. Compatible with MLflow ResponsesAgent schema."""
-    from agent.agent import AGENT
-    from mlflow.types.responses import ResponsesAgentRequest
+    """Start an agent task and return a task_id for polling.
 
+    The agent runs in a background thread.  The frontend polls
+    GET /api/tasks/{task_id} every few seconds to retrieve the result.
+    This avoids Databricks Apps reverse-proxy hard timeout (~120 s).
+    """
     messages = request.get("input") or []
     if not messages or not any(m.get("content") for m in messages):
         raise HTTPException(400, "Please provide at least one message with content.")
 
-    try:
-        agent_request = ResponsesAgentRequest(**request)
-        response = AGENT.predict(agent_request)
-        return response.model_dump(exclude_none=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Agent error: {e}")
+    _cleanup_tasks()
+
+    task_id = _uuid.uuid4().hex[:12]
+    _tasks[task_id] = {"status": "running", "created": _time.time()}
+
+    def _run():
+        try:
+            from agent.agent import AGENT
+            from mlflow.types.responses import ResponsesAgentRequest
+            agent_request = ResponsesAgentRequest(**request)
+            response = AGENT.predict(agent_request)
+            _tasks[task_id]["result"] = response.model_dump(exclude_none=True)
+            _tasks[task_id]["status"] = "complete"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _tasks[task_id]["error"] = str(e)
+            _tasks[task_id]["status"] = "error"
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"task_id": task_id, "status": "running"}
 
 
-@app.post("/invocations/stream")
-async def invocations_stream(request: dict):
-    """Streaming agent invocation."""
-    from agent.agent import AGENT
-    from mlflow.types.responses import ResponsesAgentRequest
-    from fastapi.responses import StreamingResponse
-    import json as json_mod
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    """Poll for the result of a background agent task."""
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found or expired")
 
-    agent_request = ResponsesAgentRequest(**request)
+    if task["status"] == "running":
+        elapsed = _time.time() - task.get("created", _time.time())
+        return {"task_id": task_id, "status": "running", "elapsed_seconds": round(elapsed, 1)}
 
-    async def event_generator():
-        for event in AGENT.predict_stream(agent_request):
-            yield f"data: {json_mod.dumps(event.model_dump(exclude_none=True))}\n\n"
-        yield "data: [DONE]\n\n"
+    if task["status"] == "error":
+        return {"task_id": task_id, "status": "error", "detail": task.get("error", "Unknown error")}
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    result = task.get("result", {})
+    _tasks.pop(task_id, None)
+    return {"task_id": task_id, "status": "complete", **result}
 
 
 # ---------------------------------------------------------------------------

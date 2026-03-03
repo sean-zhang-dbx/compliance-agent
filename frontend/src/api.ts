@@ -13,6 +13,27 @@ export interface UploadResult {
   status: string;
 }
 
+function extractText(data: Record<string, unknown>): string {
+  let text = "";
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (output) {
+    for (const item of output) {
+      if (item.text) {
+        text += item.text;
+      } else if (item.content) {
+        for (const block of item.content as Array<Record<string, unknown>>) {
+          if (block.text) text += block.text;
+        }
+      }
+    }
+  }
+  return text;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function sendMessage(
   messages: AgentMessage[]
 ): Promise<AgentMessage> {
@@ -35,21 +56,37 @@ export async function sendMessage(
   }
 
   const data = await response.json();
-  let text = "";
 
-  if (data.output) {
-    for (const item of data.output) {
-      if (item.text) {
-        text += item.text;
-      } else if (item.content) {
-        for (const block of item.content) {
-          if (block.text) text += block.text;
-        }
+  if (data.task_id) {
+    const taskId = data.task_id as string;
+    const maxPollTime = 600_000;
+    const start = Date.now();
+    let pollInterval = 2000;
+
+    while (Date.now() - start < maxPollTime) {
+      await sleep(pollInterval);
+      if (pollInterval < 5000) pollInterval += 500;
+
+      const pollResp = await fetch(`${BACKEND_URL}/api/tasks/${taskId}`, {
+        credentials: "include",
+      });
+      if (!pollResp.ok) {
+        throw new Error(`Poll error (${pollResp.status})`);
+      }
+      const pollData = await pollResp.json();
+
+      if (pollData.status === "running") continue;
+      if (pollData.status === "error") {
+        throw new Error(`Agent error: ${pollData.detail || "unknown"}`);
+      }
+      if (pollData.status === "complete") {
+        return { role: "assistant", content: extractText(pollData) || "Agent completed processing." };
       }
     }
+    throw new Error("Agent timed out after 10 minutes.");
   }
 
-  return { role: "assistant", content: text || "Agent completed processing." };
+  return { role: "assistant", content: extractText(data) || "Agent completed processing." };
 }
 
 export async function uploadFile(file: File): Promise<UploadResult> {
