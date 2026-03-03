@@ -1,0 +1,12 @@
+mlflow>=3.1
+databricks-langchain
+langgraph>=0.3.4
+langchain-core
+databricks-sdk
+fastapi
+uvicorn[standard]
+openpyxl
+PyMuPDF
+python-multipart
+Pillow
+requests

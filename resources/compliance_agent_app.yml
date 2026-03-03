@@ -1,0 +1,9 @@
+resources:
+  apps:
+    compliance_agent:
+      name: gsk-compliance-agent-${bundle.target}
+      description: "GSK Controls Evidence Review Agent — multi-control compliance testing with LangGraph, embedded image extraction, email integration, and workflow tracking"
+      source_code_path: ../deploy_app
+      permissions:
+        - level: CAN_USE
+          group_name: users

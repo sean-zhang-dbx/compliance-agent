@@ -1,0 +1,35 @@
+command:
+  - uvicorn
+  - main:app
+  - --host=0.0.0.0
+  - --port=8000
+
+env:
+  - name: LLM_ENDPOINT
+    value: databricks-claude-3-7-sonnet
+  - name: VISION_LLM_ENDPOINT
+    value: databricks-claude-3-7-sonnet
+  - name: UC_CATALOG
+    value: catalog_sandbox_e1b2kq
+  - name: UC_SCHEMA
+    value: gsk_compliance
+  - name: UC_VOLUME
+    value: evidence_files
+  - name: MLFLOW_EXPERIMENT_NAME
+    value: /Users/${DATABRICKS_USER}/gsk-compliance-agent
+  - name: GRAPH_TENANT_ID
+    value: ""
+  - name: GRAPH_CLIENT_ID
+    value: ""
+  - name: GRAPH_CLIENT_SECRET
+    value: ""
+  - name: GRAPH_SENDER_EMAIL
+    value: ""
+
+resources:
+  - name: serving-endpoint
+    serving_endpoint: databricks-claude-3-7-sonnet
+    permission: CAN_QUERY
+  - name: mlflow-experiment
+    mlflow_experiment: /Users/${DATABRICKS_USER}/gsk-compliance-agent
+    permission: CAN_EDIT

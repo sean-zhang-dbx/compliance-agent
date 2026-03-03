@@ -1,0 +1,30 @@
+bundle:
+  name: gsk-compliance-agent
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    default: catalog_sandbox_e1b2kq
+  schema:
+    default: gsk_compliance
+  volume:
+    default: evidence_files
+  llm_endpoint:
+    default: databricks-claude-3-7-sonnet
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://adb-7405607844735163.3.azuredatabricks.net
+      profile: DEFAULT
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-7405607844735163.3.azuredatabricks.net
+      profile: DEFAULT
+      root_path: /Workspace/Users/sean.zhang@databricks.com/.bundle/${bundle.name}/${bundle.target}

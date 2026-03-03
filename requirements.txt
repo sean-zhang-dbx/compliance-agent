@@ -1,0 +1,18 @@
+# Core agent
+mlflow>=3.1
+databricks-langchain
+langgraph>=0.3.4
+langchain-core
+databricks-sdk
+
+# Document processing
+openpyxl
+PyMuPDF
+
+# Server (Databricks Apps / local)
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Data generation (optional)
+fpdf2

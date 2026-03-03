@@ -1,0 +1,76 @@
+{
+  "number": "ENG-2024-HR-001",
+  "name": "HR Controls - Segregation of Duties Monitoring 2024",
+  "type": "Fieldwork",
+  "state": "Fieldwork",
+  "tracking_id": "56063400",
+  "record_type": "IT Controls",
+  "engagement_lead": "Michael Chen",
+  "planned_start": "01-Dec-2024",
+  "notification_emails": {
+    "report_to": "sean.zhang@databricks.com",
+    "exceptions_to": "sean.zhang@databricks.com"
+  },
+  "control_objective": {
+    "control_id": "HR-003",
+    "control_name": "Segregation of Duties Monitoring",
+    "domain": "HR / IT Controls",
+    "policy_reference": "GSK-HR-POL-003 v2.0",
+    "rules": {
+      "conflicting_pairs": [
+        [
+          "Create Purchase Order",
+          "Approve Purchase Order"
+        ],
+        [
+          "Create Vendor",
+          "Process Payment"
+        ],
+        [
+          "Post Journal Entry",
+          "Approve Journal Entry"
+        ],
+        [
+          "Maintain User Access",
+          "Approve Access Changes"
+        ]
+      ],
+      "compensating_control_required": true
+    }
+  },
+  "testing_attributes": [
+    {
+      "ref": "A",
+      "name": "SoD conflict matrix obtained and complete",
+      "applies_to": "all"
+    },
+    {
+      "ref": "B",
+      "name": "All SoD conflicts identified and documented",
+      "applies_to": "all"
+    },
+    {
+      "ref": "C",
+      "name": "Compensating controls documented for all conflicts",
+      "applies_to": "conflicts"
+    }
+  ],
+  "instructions": "Execute fieldwork for Control HR-003. Obtain the SoD conflict matrix, verify all conflicts are identified, and confirm compensating controls are documented for each conflict. Review SAP role configuration screenshots.",
+  "evidence_files": [
+    {
+      "path": "evidence/sod_conflict_report.pdf",
+      "type": "pdf",
+      "focus": "conflict_identification"
+    },
+    {
+      "path": "evidence/sap_role_screenshot.png",
+      "type": "screenshot",
+      "focus": "role_configuration"
+    },
+    {
+      "path": "evidence/remediation_tracker.pdf",
+      "type": "pdf",
+      "focus": "compensating_controls"
+    }
+  ]
+}

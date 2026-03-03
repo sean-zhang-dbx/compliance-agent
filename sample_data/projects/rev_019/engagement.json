@@ -1,0 +1,70 @@
+{
+  "number": "ENG-2024-REV-001",
+  "name": "Revenue Controls - Cutoff Testing Q4 2024",
+  "type": "Fieldwork",
+  "state": "Fieldwork",
+  "tracking_id": "56063500",
+  "record_type": "Finance",
+  "engagement_lead": "James Wright",
+  "planned_start": "15-Jan-2025",
+  "notification_emails": {
+    "report_to": "sean.zhang@databricks.com",
+    "exceptions_to": "sean.zhang@databricks.com"
+  },
+  "control_objective": {
+    "control_id": "REV-019",
+    "control_name": "Revenue Recognition Cutoff Testing",
+    "domain": "Revenue / Financial Reporting",
+    "policy_reference": "GSK-REV-POL-019 v1.5",
+    "rules": {
+      "cutoff_window_days": 5,
+      "delivery_confirmation_required": true,
+      "period_end": "31-Dec-2024"
+    }
+  },
+  "testing_attributes": [
+    {
+      "ref": "A",
+      "name": "Cutoff population obtained (orders +/- 5 days of period end)",
+      "applies_to": "all"
+    },
+    {
+      "ref": "B",
+      "name": "Revenue recognized in correct accounting period",
+      "applies_to": "all"
+    },
+    {
+      "ref": "C",
+      "name": "Delivery confirmed before revenue recognition",
+      "applies_to": "all"
+    },
+    {
+      "ref": "D",
+      "name": "Credit notes near period end reviewed",
+      "applies_to": "credit_notes"
+    }
+  ],
+  "instructions": "Execute fieldwork for Control REV-019. Test revenue cutoff by examining sales orders shipped within +/- 5 days of December 31, 2024. Verify delivery was confirmed before revenue was recognized. Review delivery photos and shipping documents. Check credit notes issued near period end.",
+  "evidence_files": [
+    {
+      "path": "evidence/shipping_manifest.pdf",
+      "type": "pdf",
+      "focus": "shipment_dates"
+    },
+    {
+      "path": "evidence/delivery_photo_001.jpg",
+      "type": "screenshot",
+      "focus": "delivery_confirmation"
+    },
+    {
+      "path": "evidence/delivery_photo_002.jpg",
+      "type": "screenshot",
+      "focus": "delivery_confirmation"
+    },
+    {
+      "path": "evidence/credit_notes.pdf",
+      "type": "pdf",
+      "focus": "credit_notes"
+    }
+  ]
+}

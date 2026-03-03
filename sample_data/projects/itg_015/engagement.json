@@ -1,0 +1,70 @@
+{
+  "number": "ENG-2024-ITG-001",
+  "name": "IT General Controls - User Access Review Q1-Q4 2024",
+  "type": "Fieldwork",
+  "state": "Fieldwork",
+  "tracking_id": "56063200",
+  "record_type": "IT Controls",
+  "engagement_lead": "Priya Nair",
+  "planned_start": "15-Oct-2024",
+  "notification_emails": {
+    "report_to": "sean.zhang@databricks.com",
+    "exceptions_to": "sean.zhang@databricks.com"
+  },
+  "control_objective": {
+    "control_id": "ITG-015",
+    "control_name": "User Access Review and Recertification",
+    "domain": "IT General Controls",
+    "policy_reference": "GSK-IT-POL-015 v2.1",
+    "rules": {
+      "review_cadence": "Quarterly",
+      "removal_sla_days": 30,
+      "privileged_access_justification_required": true
+    }
+  },
+  "testing_attributes": [
+    {
+      "ref": "A",
+      "name": "Complete user access list obtained from system",
+      "applies_to": "all"
+    },
+    {
+      "ref": "B",
+      "name": "Quarterly access reviews completed on time",
+      "applies_to": "all"
+    },
+    {
+      "ref": "C",
+      "name": "Terminated users removed within 30-day SLA",
+      "applies_to": "terminated_users"
+    },
+    {
+      "ref": "D",
+      "name": "Privileged access has documented justification",
+      "applies_to": "privileged_users"
+    }
+  ],
+  "instructions": "Execute fieldwork for Control ITG-015. Verify that user access reviews were performed quarterly, terminated users were removed within SLA, and privileged access is justified. Review screenshots from the IAM portal and access reports.",
+  "evidence_files": [
+    {
+      "path": "evidence/access_review_q1.png",
+      "type": "screenshot",
+      "focus": "quarterly_review_completion"
+    },
+    {
+      "path": "evidence/access_review_q2.png",
+      "type": "screenshot",
+      "focus": "quarterly_review_completion"
+    },
+    {
+      "path": "evidence/access_report.pdf",
+      "type": "pdf",
+      "focus": "user_access_listing"
+    },
+    {
+      "path": "evidence/access_policy.pdf",
+      "type": "pdf",
+      "focus": "policy"
+    }
+  ]
+}

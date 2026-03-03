@@ -1,0 +1,84 @@
+{
+  "number": "ENG-2024-P2P-001",
+  "name": "P2P Payment Proposal Review - Above Country 2024",
+  "type": "Fieldwork",
+  "state": "Fieldwork",
+  "tracking_id": "56063177",
+  "record_type": "Finance",
+  "engagement_lead": "Rohit Rego",
+  "planned_start": "06-Sep-2024",
+  "notification_emails": {
+    "report_to": "sean.zhang@databricks.com",
+    "exceptions_to": "sean.zhang@databricks.com"
+  },
+  "control_objective": {
+    "control_id": "P2P-028",
+    "control_name": "Payment Proposal Approval and Threshold Review",
+    "domain": "Accounts Payable",
+    "policy_reference": "GSK-FIN-POL-028 v3.2",
+    "rules": {
+      "threshold_gbp": 50000,
+      "approval_matrix": {
+        "below_50k": "Automated approval",
+        "50k_to_250k": "Finance Director",
+        "250k_to_1m": "VP Finance",
+        "above_1m": "CFO"
+      }
+    }
+  },
+  "testing_attributes": [
+    {
+      "ref": "A",
+      "name": "Payment proposal list obtained",
+      "applies_to": "all"
+    },
+    {
+      "ref": "B",
+      "name": "Threshold check performed",
+      "applies_to": "all"
+    },
+    {
+      "ref": "C",
+      "name": "Above-threshold approval verified",
+      "applies_to": "above_threshold"
+    },
+    {
+      "ref": "D",
+      "name": "Supporting documents reviewed",
+      "applies_to": "above_threshold"
+    },
+    {
+      "ref": "E",
+      "name": "Blocked payments reviewed",
+      "applies_to": "control_level"
+    },
+    {
+      "ref": "F",
+      "name": "Prepayments/down payments reviewed",
+      "applies_to": "control_level"
+    }
+  ],
+  "instructions": "Execute fieldwork for Control P2P-028. Test all 6 attributes (A-F) against the selected sample. Review supporting evidence documents. Document findings in the Issue template.",
+  "evidence_files": [
+    {
+      "path": "evidence/payment_proposal_list.pdf",
+      "type": "pdf",
+      "focus": "proposal_list"
+    },
+    {
+      "path": "evidence/approval_evidence.pdf",
+      "type": "pdf",
+      "focus": "approvals"
+    },
+    {
+      "path": "evidence/supporting_docs.pdf",
+      "type": "pdf",
+      "focus": "supporting_docs"
+    },
+    {
+      "path": "evidence/policy_reference.pdf",
+      "type": "pdf",
+      "focus": "policy"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+node_modules/
+frontend/dist/
+.DS_Store
+*.tmp
+/tmp/
+
+# Generated artifacts
+mlflow.db
+mlflow_test.db
+mlruns/
+sample_data/projects/*/report_*.md
+sample_data/projects/*/report_*.json
+sample_data/projects/*/sent_email_*.eml
+deploy_app/sample_data/projects/*/report_*.md
+deploy_app/sample_data/projects/*/report_*.json
+deploy_app/sample_data/projects/*/sent_email_*.eml
