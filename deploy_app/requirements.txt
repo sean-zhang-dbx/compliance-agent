@@ -8,5 +8,3 @@ uvicorn[standard]
 openpyxl
 PyMuPDF
 python-multipart
-Pillow
-requests

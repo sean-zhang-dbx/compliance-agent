@@ -5,6 +5,12 @@ export interface AgentMessage {
   content: string;
 }
 
+export interface SubProgress {
+  completed: number;
+  total: number;
+  detail?: string;
+}
+
 export interface ToolStep {
   tool: string;
   label: string;
@@ -15,6 +21,23 @@ export interface ToolStep {
   artifact?: string;
   artifact_volume_path?: string;
   workbook_artifact?: string;
+  sub_progress?: SubProgress;
+}
+
+export interface ThinkingEntry {
+  content: string;
+  timestamp: number;
+}
+
+export interface PlanStep {
+  id: string;
+  label: string;
+  detail?: string;
+  status: "pending" | "in_progress" | "complete";
+}
+
+export interface AgentPlan {
+  steps: PlanStep[];
 }
 
 export interface UploadResult {
@@ -73,6 +96,7 @@ export async function sendMessage(
   onStepsUpdate?: (steps: ToolStep[], currentStep: string | null, elapsed: number) => void,
   onTaskId?: (taskId: string) => void,
   signal?: AbortSignal,
+  onThinkingUpdate?: (thinking: ThinkingEntry[], plan: AgentPlan | null) => void,
 ): Promise<SendResult> {
   const response = await fetch(`${BACKEND_URL}/invocations`, {
     method: "POST",
@@ -127,6 +151,12 @@ export async function sendMessage(
           pollData.elapsed_seconds || 0,
         );
       }
+      if (onThinkingUpdate) {
+        onThinkingUpdate(
+          (pollData.thinking || []) as ThinkingEntry[],
+          (pollData.plan || null) as AgentPlan | null,
+        );
+      }
 
       if (pollData.status === "running" || pollData.status === "cancelling") continue;
       if (pollData.status === "cancelled") {
@@ -141,6 +171,12 @@ export async function sendMessage(
       if (pollData.status === "complete") {
         if (onStepsUpdate && pollData.steps) {
           onStepsUpdate(pollData.steps as ToolStep[], null, pollData.elapsed_seconds || 0);
+        }
+        if (onThinkingUpdate) {
+          onThinkingUpdate(
+            (pollData.thinking || []) as ThinkingEntry[],
+            (pollData.plan || null) as AgentPlan | null,
+          );
         }
         return {
           message: { role: "assistant", content: extractText(pollData) || "Agent completed processing." },
@@ -252,6 +288,8 @@ export interface RunManifest {
   completed_at?: string;
   steps?: ToolStep[];
   total_steps?: number;
+  thinking?: ThinkingEntry[];
+  plan?: AgentPlan | null;
   [key: string]: unknown;
 }
 

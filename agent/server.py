@@ -69,13 +69,14 @@ def _cache_local(project_dir: str, run_id: str, filename: str,
 
 def _step_filename(tool_name: str, step_index: int, args: dict) -> str:
     """Generate a descriptive filename for a step artifact in steps/."""
+    short = _short_tool_name(tool_name)
     tag = ""
-    if tool_name in ("review_document", "review_screenshot", "analyze_email"):
+    if short in ("review_document", "review_screenshot", "analyze_email"):
         fname = (args.get("file_path", "") or "").split("/")[-1]
         tag = f"_{Path(fname).stem}" if fname else ""
-    elif tool_name == "execute_test":
+    elif short == "execute_test":
         tag = f"_{args.get('test_ref', 'X')}"
-    return f"{step_index:03d}_{tool_name}{tag}.json"
+    return f"{step_index:03d}_{short}{tag}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +85,23 @@ def _step_filename(tool_name: str, step_index: int, args: dict) -> str:
 _tasks: dict[str, dict] = {}
 _TASK_TTL = 600
 
-TOOL_LABELS: dict[str, str] = {
+def _uc_name(short: str) -> str:
+    """Build the fully qualified UC function name used by UCFunctionToolkit."""
+    from agent.config import UC_CATALOG, UC_SCHEMA
+    return f"{UC_CATALOG}__{UC_SCHEMA}__{short}"
+
+_SHORT_NAMES = [
+    "list_projects", "load_engagement", "announce_plan", "parse_workbook",
+    "extract_workbook_images", "batch_review_evidence", "batch_execute_tests",
+    "review_document", "review_screenshot", "analyze_email",
+    "generate_test_plan", "execute_test", "aggregate_test_results",
+    "compile_results", "fill_workbook", "save_report", "send_email", "ask_user",
+]
+
+_LABEL_MAP = {
     "list_projects": "Discovering projects",
     "load_engagement": "Loading engagement instructions",
+    "announce_plan": "Announcing assessment plan",
     "parse_workbook": "Parsing workbook (data, rules, sample)",
     "extract_workbook_images": "Extracting embedded images",
     "batch_review_evidence": "Reviewing all evidence (parallel)",
@@ -96,6 +111,7 @@ TOOL_LABELS: dict[str, str] = {
     "analyze_email": "Analyzing email evidence",
     "generate_test_plan": "Computing test matrix",
     "execute_test": "Testing attribute",
+    "aggregate_test_results": "Aggregating results (deterministic)",
     "compile_results": "Compiling results into report",
     "fill_workbook": "Filling out engagement workbook",
     "save_report": "Saving report to project",
@@ -103,13 +119,63 @@ TOOL_LABELS: dict[str, str] = {
     "ask_user": "Waiting for user input",
 }
 
-ARTIFACT_TOOLS = {
+# Mapping from plan step IDs to the tools that belong to that phase.
+# Used to auto-advance plan checklist items as tools start/complete.
+PLAN_TOOL_MAP: dict[str, list[str]] = {
+    "load": ["load_engagement", "parse_workbook", "extract_workbook_images"],
+    "images": ["extract_workbook_images"],
+    "evidence": ["batch_review_evidence", "review_document", "review_screenshot", "analyze_email"],
+    "test": ["generate_test_plan", "batch_execute_tests", "execute_test"],
+    "aggregate": ["aggregate_test_results"],
+    "compile": ["compile_results"],
+    "deliver": ["fill_workbook", "save_report", "send_email"],
+}
+
+def _advance_plan(task: dict, tool_short: str, event: str):
+    """Update plan step statuses based on tool start/completion events.
+    event is 'start' or 'complete'."""
+    plan = task.get("plan")
+    if not plan:
+        return
+    for ps in plan["steps"]:
+        pid = ps["id"]
+        mapped_tools = PLAN_TOOL_MAP.get(pid, [])
+        if tool_short not in mapped_tools:
+            continue
+        if event == "start" and ps["status"] == "pending":
+            ps["status"] = "in_progress"
+        elif event == "complete" and ps["status"] in ("pending", "in_progress"):
+            started_tools = {
+                _short_tool_name(s["tool"])
+                for s in task.get("steps", [])
+                if _short_tool_name(s["tool"]) in mapped_tools
+            }
+            completed_tools = {
+                _short_tool_name(s["tool"])
+                for s in task.get("steps", [])
+                if s.get("status") == "complete" and _short_tool_name(s["tool"]) in mapped_tools
+            }
+            still_running = started_tools - completed_tools
+            if not still_running:
+                ps["status"] = "complete"
+            elif ps["status"] == "pending":
+                ps["status"] = "in_progress"
+
+TOOL_LABELS: dict[str, str] = {}
+for _sn in _SHORT_NAMES:
+    TOOL_LABELS[_sn] = _LABEL_MAP[_sn]
+    TOOL_LABELS[_uc_name(_sn)] = _LABEL_MAP[_sn]
+
+_ARTIFACT_SHORT = {
     "load_engagement", "parse_workbook", "extract_workbook_images",
     "batch_review_evidence", "batch_execute_tests",
     "review_document", "review_screenshot", "analyze_email",
-    "generate_test_plan", "execute_test", "compile_results",
-    "fill_workbook", "save_report", "send_email",
+    "generate_test_plan", "execute_test", "aggregate_test_results",
+    "compile_results", "fill_workbook", "save_report", "send_email",
 }
+ARTIFACT_TOOLS = set(_ARTIFACT_SHORT)
+for _sn in _ARTIFACT_SHORT:
+    ARTIFACT_TOOLS.add(_uc_name(_sn))
 
 
 def _cleanup_tasks():
@@ -119,7 +185,15 @@ def _cleanup_tasks():
         _tasks.pop(k, None)
 
 
+def _short_tool_name(name: str) -> str:
+    """Extract the short tool name from a UC-qualified name like 'catalog__schema__tool'."""
+    if "__" in name:
+        return name.rsplit("__", 1)[-1]
+    return name
+
+
 def _summarize_args(name: str, args: dict) -> str:
+    name = _short_tool_name(name)
     if name == "load_engagement":
         return args.get("project_path", "")
     if name == "parse_workbook":
@@ -168,9 +242,31 @@ def _summarize_args(name: str, args: dict) -> str:
 
 
 def _summarize_result(name: str, result_str: str) -> str:
+    name = _short_tool_name(name)
     import json as _json
     try:
         d = _json.loads(result_str)
+        # Unwrap UC function result envelope: {"format": "SCALAR", "value": "...", "truncated": ...}
+        if isinstance(d, dict) and "format" in d and "value" in d:
+            inner = d["value"]
+            if isinstance(inner, str):
+                try:
+                    d = _json.loads(inner)
+                except Exception:
+                    return inner[:500]
+            else:
+                d = inner
+        if isinstance(d, list) and name == "aggregate_test_results":
+            refs = []
+            exc_total = 0
+            for entry in d:
+                ref = entry.get("ref", "?")
+                res = entry.get("result", "?")
+                excs = len(entry.get("exceptions", []))
+                exc_total += excs
+                exc_str = f" ({excs} exc)" if excs else ""
+                refs.append(f"{ref}:{res}{exc_str}")
+            return " | ".join(refs)
         if isinstance(d, dict):
             if name == "load_engagement":
                 co = d.get("control_objective", {})
@@ -216,8 +312,19 @@ def _summarize_result(name: str, result_str: str) -> str:
                     except Exception:
                         pass
                 return f"{d.get('result', d.get('test_ref', '?'))} — {(analysis or '')[:400]}"
+            if name == "aggregate_test_results":
+                if isinstance(d, list):
+                    refs = []
+                    for entry in d:
+                        ref = entry.get("ref", "?")
+                        res = entry.get("result", "?")
+                        excs = len(entry.get("exceptions", []))
+                        exc_str = f" ({excs} exc)" if excs else ""
+                        refs.append(f"{ref}:{res}{exc_str}")
+                    return " | ".join(refs)
+                return result_str[:500]
             if name == "compile_results":
-                return f"Report generated ({len(result_str)} chars)"
+                return result_str[:500]
             if name == "fill_workbook":
                 fname = d.get("filename", "")
                 attrs = d.get("attrs_filled", 0)
@@ -239,6 +346,35 @@ def _summarize_result(name: str, result_str: str) -> str:
     except Exception:
         pass
     return result_str[:500] if len(result_str) > 500 else result_str
+
+
+_THINKING_TEMPLATES: dict[str, str] = {
+    "list_projects": "Let me discover what projects are available for review.",
+    "load_engagement": "Loading the engagement data for {arg} to understand control requirements, testing attributes, and evidence files.",
+    "announce_plan": "Planning the assessment workflow and outlining the steps I'll follow.",
+    "parse_workbook": "Parsing the engagement workbook to extract testing data, sample items, and control parameters.",
+    "extract_workbook_images": "Extracting embedded images from the workbook for visual evidence analysis.",
+    "batch_review_evidence": "Reviewing {arg} in parallel to build a comprehensive understanding of the control documentation.",
+    "batch_execute_tests": "Executing {arg} in parallel against the evidence gathered.",
+    "review_document": "Analyzing document: {arg} — extracting key data points relevant to the control testing.",
+    "review_screenshot": "Examining screenshot: {arg} — looking for visual evidence of control compliance.",
+    "analyze_email": "Reviewing email: {arg} — checking communication trails for control documentation.",
+    "generate_test_plan": "Computing the test matrix — mapping testing attributes to sample items from the workbook.",
+    "execute_test": "Testing attribute {arg} — evaluating evidence against the control requirements.",
+    "aggregate_test_results": "Aggregating all test results using deterministic rules to calculate pass/fail outcomes.",
+    "compile_results": "Compiling all findings into a structured audit report with narrative, exceptions, and recommendations.",
+    "fill_workbook": "Writing test results, narratives, and exceptions back into the engagement workbook.",
+    "save_report": "Saving the completed audit report to the project.",
+    "send_email": "Sending notification email with the assessment results to {arg}.",
+}
+
+
+def _generate_thinking(short_name: str, args: dict) -> str:
+    template = _THINKING_TEMPLATES.get(short_name, "")
+    if not template:
+        return ""
+    arg = _summarize_args(short_name, args)
+    return template.format(arg=arg) if "{arg}" in template else template
 
 
 def _detect_project(messages: list) -> str:
@@ -270,7 +406,7 @@ def _serialize_steps_for_audit(steps: list[dict]) -> list[dict]:
 
 def _get_fill_workbook_xlsx(tool_name: str, result_str: str) -> str | None:
     """Extract the .xlsx filename from a fill_workbook tool result."""
-    if tool_name != "fill_workbook":
+    if _short_tool_name(tool_name) != "fill_workbook":
         return None
     try:
         d = json.loads(result_str)
@@ -609,11 +745,23 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
             "current_step": None,
             "run_id": run_id,
             "project_dir": project_dir,
+            "thinking": [],
+            "plan": None,
         }
+
+        def _make_progress_callback(tid: str):
+            """Create a callback that updates sub_progress on the last running batch step."""
+            def _cb(completed: int, total: int, detail: str = ""):
+                steps = _tasks.get(tid, {}).get("steps", [])
+                for s in reversed(steps):
+                    if s.get("status") == "running":
+                        s["sub_progress"] = {"completed": completed, "total": total, "detail": detail}
+                        break
+            return _cb
 
         def _run():
             from agent.config import APP_BASE_URL
-            from agent.run_context import set_run_context
+            from agent.run_context import set_run_context, set_progress_callback
             from agent.graph import clear_cancel, is_cancelled, CancelledError
             try:
                 from agent.agent import AGENT
@@ -631,6 +779,7 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                     project_dir=project_dir,
                     app_base_url=APP_BASE_URL,
                 )
+                set_progress_callback(_make_progress_callback(task_id))
 
                 agent_request = ResponsesAgentRequest(**request)
                 lc_messages = to_chat_completions_input(
@@ -665,35 +814,65 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                             continue
 
                         for msg in msgs:
-                            if isinstance(msg, AIMessage) and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    tool_name = tc["name"]
-                                    tool_args = tc.get("args", {})
-                                    call_id = tc.get("id", "")
-                                    _tasks[task_id]["current_step"] = tool_name
-                                    _tasks[task_id]["steps"].append({
-                                        "tool": tool_name,
-                                        "label": TOOL_LABELS.get(tool_name, tool_name),
-                                        "args_summary": _summarize_args(tool_name, tool_args),
-                                        "status": "running",
-                                        "started_at": _time.time(),
-                                        "_call_id": call_id,
-                                        "_step_idx": step_counter[0],
+                            if isinstance(msg, AIMessage):
+                                narration = ""
+                                if isinstance(msg.content, str) and msg.content.strip():
+                                    narration = msg.content.strip()
+                                elif isinstance(msg.content, list):
+                                    parts = []
+                                    for b in msg.content:
+                                        if isinstance(b, dict):
+                                            if b.get("type") == "text" and b.get("text", "").strip():
+                                                parts.append(b["text"].strip())
+                                            elif b.get("type") == "thinking" and b.get("thinking", "").strip():
+                                                parts.append(b["thinking"].strip())
+                                    narration = " ".join(parts).strip()
+                                if narration:
+                                    _tasks[task_id]["thinking"].append({
+                                        "content": narration,
+                                        "timestamp": _time.time(),
                                     })
-                                    pending_args[call_id] = {"name": tool_name, "args": tool_args, "idx": step_counter[0]}
-                                    step_counter[0] += 1
 
-                                    if tool_name == "load_engagement":
-                                        p = tool_args.get("project_path", "")
-                                        if p and not detected_project:
-                                            detected_project = p
-                                            _tasks[task_id]["project_dir"] = p
-                                            manifest["project_dir"] = p
-                                            set_run_context(
-                                                run_id=run_id,
-                                                project_dir=p,
-                                                app_base_url=APP_BASE_URL,
-                                            )
+                                if msg.tool_calls:
+                                    for tc in msg.tool_calls:
+                                        tool_name = tc["name"]
+                                        tool_args = tc.get("args", {})
+                                        call_id = tc.get("id", "")
+                                        short = _short_tool_name(tool_name)
+
+                                        thinking_text = _generate_thinking(short, tool_args)
+                                        if thinking_text:
+                                            _tasks[task_id]["thinking"].append({
+                                                "content": thinking_text,
+                                                "timestamp": _time.time(),
+                                            })
+
+                                        _tasks[task_id]["current_step"] = tool_name
+                                        _tasks[task_id]["steps"].append({
+                                            "tool": tool_name,
+                                            "label": TOOL_LABELS.get(tool_name, tool_name),
+                                            "args_summary": _summarize_args(tool_name, tool_args),
+                                            "status": "running",
+                                            "started_at": _time.time(),
+                                            "_call_id": call_id,
+                                            "_step_idx": step_counter[0],
+                                        })
+                                        pending_args[call_id] = {"name": tool_name, "args": tool_args, "idx": step_counter[0]}
+                                        step_counter[0] += 1
+
+                                        _advance_plan(_tasks[task_id], short, "start")
+
+                                        if short == "load_engagement":
+                                            p = tool_args.get("project_path", "")
+                                            if p and not detected_project:
+                                                detected_project = p
+                                                _tasks[task_id]["project_dir"] = p
+                                                manifest["project_dir"] = p
+                                                set_run_context(
+                                                    run_id=run_id,
+                                                    project_dir=p,
+                                                    app_base_url=APP_BASE_URL,
+                                                )
 
                             elif isinstance(msg, ToolMessage):
                                 call_id = msg.tool_call_id
@@ -719,8 +898,31 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                                     tool_args = tool_info.get("args", {})
                                     step_idx = tool_info.get("idx", 0)
 
+                                    short_name = _short_tool_name(tool_name)
+
+                                    # Parse announce_plan result into structured plan
+                                    if short_name == "announce_plan":
+                                        try:
+                                            plan_data = json.loads(result_str)
+                                            plan_steps = plan_data.get("steps", [])
+                                            _tasks[task_id]["plan"] = {
+                                                "steps": [
+                                                    {"id": s["id"], "label": s["label"],
+                                                     "detail": s.get("detail", ""), "status": "pending"}
+                                                    for s in plan_steps
+                                                ]
+                                            }
+                                            # Retroactively mark plan steps for tools that already completed
+                                            for prev_step in _tasks[task_id].get("steps", []):
+                                                if prev_step.get("status") == "complete":
+                                                    prev_short = _short_tool_name(prev_step["tool"])
+                                                    _advance_plan(_tasks[task_id], prev_short, "complete")
+                                        except Exception:
+                                            pass
+
+                                    _advance_plan(_tasks[task_id], short_name, "complete")
                                     if tool_name in ARTIFACT_TOOLS and detected_project:
-                                        is_top = tool_name in ("compile_results", "save_report", "send_email", "fill_workbook")
+                                        is_top = short_name in ("compile_results", "save_report", "send_email", "fill_workbook")
                                         step_fname = _step_filename(tool_name, step_idx, tool_args)
                                         content_to_save = result_str
 
@@ -733,7 +935,7 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                                             content_to_save, is_step=True,
                                         )
 
-                                        if tool_name == "compile_results":
+                                        if short_name == "compile_results":
                                             rp = _save_to_volume(detected_project, run_id, "report.md", content_to_save)
                                             _cache_local(detected_project, run_id, "report.md", content_to_save)
                                             if rp:
@@ -769,6 +971,8 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                 manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
                 manifest["total_steps"] = len(_tasks[task_id]["steps"])
                 manifest["steps"] = _serialize_steps_for_audit(_tasks[task_id]["steps"])
+                manifest["thinking"] = _tasks[task_id].get("thinking", [])
+                manifest["plan"] = _tasks[task_id].get("plan")
                 if detected_project:
                     from agent import volume_store as _vs
 
@@ -832,21 +1036,21 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
         steps = [{k: v for k, v in s.items() if k not in _internal_keys} for s in task.get("steps", [])]
         run_id = task.get("run_id", "")
         project_dir = task.get("project_dir", "")
+        thinking = task.get("thinking", [])
+        plan = task.get("plan")
+        base = {"task_id": task_id, "steps": steps, "run_id": run_id,
+                "project_dir": project_dir, "thinking": thinking, "plan": plan}
         if task["status"] in ("running", "cancelling"):
             elapsed = _time.time() - task.get("created", _time.time())
-            return {"task_id": task_id, "status": task["status"], "elapsed_seconds": round(elapsed, 1),
-                    "current_step": task.get("current_step"), "steps": steps,
-                    "run_id": run_id, "project_dir": project_dir}
+            return {**base, "status": task["status"], "elapsed_seconds": round(elapsed, 1),
+                    "current_step": task.get("current_step")}
         if task["status"] == "cancelled":
-            return {"task_id": task_id, "status": "cancelled", "detail": "Cancelled by user",
-                    "steps": steps, "run_id": run_id, "project_dir": project_dir}
+            return {**base, "status": "cancelled", "detail": "Cancelled by user"}
         if task["status"] == "error":
-            return {"task_id": task_id, "status": "error", "detail": task.get("error", "Unknown error"),
-                    "steps": steps, "run_id": run_id, "project_dir": project_dir}
+            return {**base, "status": "error", "detail": task.get("error", "Unknown error")}
         result = task.get("result", {})
         _tasks.pop(task_id, None)
-        return {"task_id": task_id, "status": "complete", "steps": steps,
-                "run_id": run_id, "project_dir": project_dir, **result}
+        return {**base, "status": "complete", **result}
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str):
@@ -868,10 +1072,36 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
     # -- Run history & artifact serving --------------------------------------
     @app.get("/api/runs/{project_dir}")
     async def list_runs(project_dir: str):
-        """List all runs for a project from UC Volume, newest first."""
+        """List all runs for a project from UC Volume + local cache, newest first."""
         from agent import volume_store as vs
-        runs = vs.list_runs(project_dir)
-        return {"project_dir": project_dir, "runs": runs, "count": len(runs)}
+        from agent.config import PROJECTS_LOCAL_PATH
+
+        vol_runs = vs.list_runs(project_dir)
+        vol_ids = {r["run_id"] for r in vol_runs}
+
+        local_runs_dir = Path(PROJECTS_LOCAL_PATH) / project_dir / "runs"
+        local_only: list[dict] = []
+        if local_runs_dir.is_dir():
+            for rd in sorted(local_runs_dir.iterdir(), reverse=True):
+                if rd.is_dir() and rd.name not in vol_ids:
+                    run_info: dict = {"run_id": rd.name, "source": "local"}
+                    manifest_f = rd / "run_manifest.json"
+                    if manifest_f.exists():
+                        try:
+                            m = json.loads(manifest_f.read_text())
+                            run_info.update({
+                                "status": m.get("status", "unknown"),
+                                "started_at": m.get("started_at", ""),
+                                "completed_at": m.get("completed_at", ""),
+                                "total_steps": m.get("total_steps", 0),
+                                "artifact_count": len(m.get("artifacts", [])),
+                            })
+                        except Exception:
+                            pass
+                    local_only.append(run_info)
+
+        all_runs = sorted(vol_runs + local_only, key=lambda r: r.get("run_id", ""), reverse=True)
+        return {"project_dir": project_dir, "runs": all_runs, "count": len(all_runs)}
 
     @app.get("/api/artifacts/{project_dir}/{run_id}/{filename:path}")
     async def get_artifact(project_dir: str, run_id: str, filename: str):

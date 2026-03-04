@@ -5,11 +5,21 @@ __pycache__/
 dist/
 build/
 .venv/
+.pytest_cache/
 node_modules/
-frontend/dist/
 .DS_Store
 *.tmp
 /tmp/
+
+# Generated build artifacts (recreated by setup.py)
+frontend/dist/
+deploy_app/agent/
+deploy_app/frontend/dist/
+deploy_app/static/
+
+# Generated test/eval outputs
+test-results/
+eval/results_*.json
 
 # Generated artifacts
 mlflow.db
@@ -18,9 +28,6 @@ mlruns/
 sample_data/projects/*/report_*.md
 sample_data/projects/*/report_*.json
 sample_data/projects/*/sent_email_*.eml
-deploy_app/sample_data/projects/*/report_*.md
-deploy_app/sample_data/projects/*/report_*.json
-deploy_app/sample_data/projects/*/sent_email_*.eml
 
 # Excel temp files
 ~$*.xlsx

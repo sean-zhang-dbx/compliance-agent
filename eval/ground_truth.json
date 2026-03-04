@@ -1,0 +1,116 @@
+{
+  "_meta": {
+    "description": "Ground-truth expected outcomes for each compliance testing project.",
+    "last_updated": "2026-03-03",
+    "notes": "Expected outcomes derived from generate_all_projects.py and generate_inv_031.py."
+  },
+  "projects": {
+    "fin_042": {
+      "control_id": "FIN-042",
+      "control_name": "Manual Journal Entry Review and Approval",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Complete JE listing obtained and sample reconciled"},
+        "B": {"expected_result": "Pass", "name": "Above-threshold JEs reviewed by Finance Director"},
+        "C": {"expected_result": "Fail", "name": "Dual authorization verified", "expected_exceptions": 1, "exception_hint": "JE-2024-0043 self-approved (preparer == approver)"},
+        "D": {"expected_result": "Fail", "name": "Supporting documentation attached", "expected_exceptions": 1, "exception_hint": "JE-2024-0145 missing supporting documentation"},
+        "E": {"expected_result": "Fail", "name": "Posted within correct accounting period", "expected_exceptions": 1, "exception_hint": "JE-2024-0112 posted to wrong accounting period"}
+      },
+      "expected_exception_count": 3,
+      "expected_pass_count": 2,
+      "expected_fail_count": 3,
+      "total_attributes": 5
+    },
+    "env_007": {
+      "control_id": "ENV-007",
+      "control_name": "Environmental Compliance Inspection and Monitoring",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Inspection schedule obtained and complete"},
+        "B": {"expected_result": "Fail", "name": "Photographic/screenshot evidence attached", "expected_exceptions": 1, "exception_hint": "One inspection missing photographic evidence"},
+        "C": {"expected_result": "Fail", "name": "Exceedances flagged and escalated", "expected_exceptions": 1, "exception_hint": "One exceedance not escalated"},
+        "D": {"expected_result": "Fail", "name": "Corrective actions tracked to closure", "expected_exceptions": 1, "exception_hint": "One corrective action overdue/open"}
+      },
+      "expected_exception_count": 3,
+      "expected_pass_count": 1,
+      "expected_fail_count": 3,
+      "total_attributes": 4
+    },
+    "p2p_028": {
+      "control_id": "P2P-028",
+      "control_name": "Payment Proposal Approval and Threshold Review",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Payment proposal list obtained"},
+        "B": {"expected_result": "Pass", "name": "Threshold check performed"},
+        "C": {"expected_result": "Fail", "name": "Above-threshold approval verified", "expected_exceptions": 1, "exception_hint": "One payment with wrong approval level"},
+        "D": {"expected_result": "Pass", "name": "Supporting documents reviewed"},
+        "E": {"expected_result": "Pass", "name": "Blocked payments reviewed"},
+        "F": {"expected_result": "Pass", "name": "Prepayments/down payments reviewed"}
+      },
+      "expected_exception_count": 1,
+      "expected_pass_count": 5,
+      "expected_fail_count": 1,
+      "total_attributes": 6
+    },
+    "itg_015": {
+      "control_id": "ITG-015",
+      "control_name": "User Access Review and Recertification",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Complete user access list obtained"},
+        "B": {"expected_result": "Fail", "name": "Quarterly access reviews completed on time", "expected_exceptions": 1, "exception_hint": "Q2 review completed 22 days late"},
+        "C": {"expected_result": "Fail", "name": "Terminated users removed within 30-day SLA", "expected_exceptions": 1, "exception_hint": "USR10045 terminated admin still active in SAP ERP"},
+        "D": {"expected_result": "Fail", "name": "Privileged access documented justification", "expected_exceptions": 1, "exception_hint": "USR10098 admin access without justification"}
+      },
+      "expected_exception_count": 3,
+      "expected_pass_count": 1,
+      "expected_fail_count": 3,
+      "total_attributes": 4
+    },
+    "rev_019": {
+      "control_id": "REV-019",
+      "control_name": "Revenue Recognition Cutoff Testing",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Cutoff population obtained"},
+        "B": {"expected_result": "Pass", "name": "Revenue recognized in correct period"},
+        "C": {"expected_result": "Fail", "name": "Delivery confirmed before recognition", "expected_exceptions": 1, "exception_hint": "SO-2024-0016 delivery not confirmed"},
+        "D": {"expected_result": "Pass", "name": "Credit notes near period end reviewed"}
+      },
+      "expected_exception_count": 1,
+      "expected_pass_count": 3,
+      "expected_fail_count": 1,
+      "total_attributes": 4
+    },
+    "hr_003": {
+      "control_id": "HR-003",
+      "control_name": "Segregation of Duties Monitoring",
+      "overall_assessment": "Effective with Exceptions",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "SoD conflict matrix obtained and complete"},
+        "B": {"expected_result": "Pass", "name": "All SoD conflicts identified and documented"},
+        "C": {"expected_result": "Fail", "name": "Compensating controls documented", "expected_exceptions": 1, "exception_hint": "One conflict missing compensating control"}
+      },
+      "expected_exception_count": 1,
+      "expected_pass_count": 2,
+      "expected_fail_count": 1,
+      "total_attributes": 3
+    },
+    "inv_031": {
+      "control_id": "INV-031",
+      "control_name": "Inventory Cycle Count Reconciliation",
+      "overall_assessment": "Effective",
+      "attributes": {
+        "A": {"expected_result": "Pass", "name": "Complete cycle count report obtained and reconciled"},
+        "B": {"expected_result": "Pass", "name": "All variances within 1% tolerance"},
+        "C": {"expected_result": "Pass", "name": "Count approved by Finance Manager"},
+        "D": {"expected_result": "Pass", "name": "Adjustments posted within 5 business days"}
+      },
+      "expected_exception_count": 0,
+      "expected_pass_count": 4,
+      "expected_fail_count": 0,
+      "total_attributes": 4
+    }
+  }
+}

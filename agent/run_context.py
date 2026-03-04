@@ -1,31 +1,35 @@
 """
-Thread-local run context shared between the backend and tools.
+Run context shared between the backend and tools.
 
-The backend sets run_id, project_dir, and app_base_url before invoking the
-agent. Tools read these values to construct accessible URLs for artifacts.
+Uses contextvars so values propagate to ThreadPoolExecutor threads
+(e.g. LangGraph ToolNode parallel execution).
 """
 
-import threading
+from contextvars import ContextVar
+from typing import Callable
 
-_ctx = threading.local()
+_run_id: ContextVar[str] = ContextVar("run_id", default="")
+_project_dir: ContextVar[str] = ContextVar("project_dir", default="")
+_app_base_url: ContextVar[str] = ContextVar("app_base_url", default="")
+_progress_callback: ContextVar[Callable | None] = ContextVar("progress_callback", default=None)
 
 
 def set_run_context(*, run_id: str, project_dir: str, app_base_url: str):
-    _ctx.run_id = run_id
-    _ctx.project_dir = project_dir
-    _ctx.app_base_url = app_base_url.rstrip("/")
+    _run_id.set(run_id)
+    _project_dir.set(project_dir)
+    _app_base_url.set(app_base_url.rstrip("/"))
 
 
 def get_run_id() -> str:
-    return getattr(_ctx, "run_id", "")
+    return _run_id.get()
 
 
 def get_project_dir() -> str:
-    return getattr(_ctx, "project_dir", "")
+    return _project_dir.get()
 
 
 def get_app_base_url() -> str:
-    return getattr(_ctx, "app_base_url", "")
+    return _app_base_url.get()
 
 
 def get_artifact_url(filename: str) -> str:
@@ -42,19 +46,36 @@ def get_report_url() -> str:
     return get_artifact_url("report.md")
 
 
+def set_progress_callback(cb: Callable | None):
+    _progress_callback.set(cb)
+
+
+def get_progress_callback() -> Callable | None:
+    return _progress_callback.get()
+
+
+def report_progress(completed: int, total: int, detail: str = ""):
+    """Report batch progress to the UI if a callback is registered."""
+    cb = _progress_callback.get()
+    if cb:
+        cb(completed, total, detail)
+
+
 def snapshot_context() -> dict:
-    """Capture the current thread's run context as a plain dict."""
+    """Capture the current run context as a plain dict."""
     return {
         "run_id": get_run_id(),
         "project_dir": get_project_dir(),
         "app_base_url": get_app_base_url(),
+        "_progress_callback": get_progress_callback(),
     }
 
 
 def restore_context(ctx: dict):
-    """Restore a snapshotted run context onto the current thread."""
+    """Restore a snapshotted run context."""
     set_run_context(
         run_id=ctx.get("run_id", ""),
         project_dir=ctx.get("project_dir", ""),
         app_base_url=ctx.get("app_base_url", ""),
     )
+    set_progress_callback(ctx.get("_progress_callback"))

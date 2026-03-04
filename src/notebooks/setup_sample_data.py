@@ -21,7 +21,7 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "catalog_sandbox_e1b2kq", "UC Catalog")
+dbutils.widgets.text("catalog", "", "UC Catalog")
 dbutils.widgets.text("schema", "gsk_compliance", "UC Schema")
 dbutils.widgets.text("volume", "evidence_files", "UC Volume")
 

@@ -41,25 +41,30 @@ SAMPLE_DATA_DIR = Path(__file__).parent.parent / "sample_data"
 
 @mlflow.trace(span_type="RETRIEVER", name="read_file")
 def _read_file_bytes(file_path: str) -> bytes:
-    """Read a file from local path, bundled sample_data, or UC volume."""
+    """Read a file from local path, bundled sample_data, or UC volume.
+
+    Resolution order (deterministic, path-aware):
+      1. Exact local path
+      2. Path-substituted local fallback (preserves directory structure)
+      3. UC Volume SDK download
+      4. Project-aware search in sample_data (matches parent dirs)
+      5. Relative-path UC Volume lookup
+    """
     p = Path(file_path)
+
+    # 1. Exact local path
     if p.exists():
         return p.read_bytes()
 
-    bundled = SAMPLE_DATA_DIR / p.name
-    if bundled.exists():
-        return bundled.read_bytes()
+    # 2. Path-substituted local fallback — preserves directory structure
+    #    e.g. /Volumes/.../projects/fin_042/engagement.json
+    #      -> .../sample_data/projects/fin_042/engagement.json
+    local_fallback = file_path.replace(VOLUME_PATH, str(SAMPLE_DATA_DIR))
+    fb = Path(local_fallback)
+    if fb.exists():
+        return fb.read_bytes()
 
-    for subdir in SAMPLE_DATA_DIR.rglob("*"):
-        if subdir.is_file() and subdir.name == p.name:
-            return subdir.read_bytes()
-
-    projects_local = Path(PROJECTS_LOCAL_PATH)
-    if projects_local.exists():
-        for candidate in projects_local.rglob(p.name):
-            if candidate.is_file():
-                return candidate.read_bytes()
-
+    # 3. UC Volume SDK download (authoritative source)
     if file_path.startswith("/Volumes/"):
         try:
             from databricks.sdk import WorkspaceClient
@@ -69,12 +74,26 @@ def _read_file_bytes(file_path: str) -> bytes:
         except Exception:
             pass
 
-    local_fallback = file_path.replace(VOLUME_PATH, str(SAMPLE_DATA_DIR))
-    fb = Path(local_fallback)
-    if fb.exists():
-        return fb.read_bytes()
+    # 4. Project-aware search in sample_data and local cache
+    #    Extract directory hints from the path to avoid cross-project matches
+    path_parts = set(Path(file_path).parts)
 
-    # Last resort: treat as relative path under the UC Volume projects dir
+    for search_root in (SAMPLE_DATA_DIR, Path(PROJECTS_LOCAL_PATH)):
+        if not search_root.exists():
+            continue
+        best_match: Path | None = None
+        best_score = -1
+        for candidate in search_root.rglob(p.name):
+            if not candidate.is_file():
+                continue
+            shared = len(set(candidate.parts) & path_parts)
+            if shared > best_score:
+                best_score = shared
+                best_match = candidate
+        if best_match is not None:
+            return best_match.read_bytes()
+
+    # 5. Relative-path UC Volume lookup
     if not file_path.startswith("/"):
         for prefix in (PROJECTS_BASE_PATH, VOLUME_PATH):
             vol_candidate = f"{prefix}/{file_path}"
@@ -87,7 +106,8 @@ def _read_file_bytes(file_path: str) -> bytes:
                 continue
 
     raise FileNotFoundError(
-        f"Cannot find '{file_path}'. Checked: {p}, sample_data (recursive), UC SDK, {fb}"
+        f"Cannot find '{file_path}'. Checked: {p}, {fb}, UC Volume SDK, "
+        f"sample_data (project-aware), PROJECTS_LOCAL_PATH"
     )
 
 
@@ -1044,6 +1064,7 @@ def _find_workbook_for_attachment(project_path: str = "") -> tuple[bytes | None,
     """Locate the most recent completed .xlsx in the current run folder.
 
     Volume-first: checks UC Volume, then falls back to local cache.
+    Falls back to scanning all local project dirs if thread context is lost.
     Returns (file_bytes, filename) or (None, "") if not found.
     """
     from agent.run_context import get_run_id, get_project_dir
@@ -1051,30 +1072,48 @@ def _find_workbook_for_attachment(project_path: str = "") -> tuple[bytes | None,
 
     run_id = get_run_id()
     proj = get_project_dir() or project_path
-    if not run_id or not proj:
-        return None, ""
+    print(f"[_find_workbook] run_id={run_id!r}, proj={proj!r}, project_path={project_path!r}")
 
-    run_base = vs.run_path(proj, run_id)
-    items = vs.list_dir(run_base)
-    xlsx_items = [
-        it for it in items
-        if it.path and it.path.endswith(".xlsx") and "_completed_" in it.path
-    ]
-    if xlsx_items:
-        xlsx_items.sort(key=lambda x: x.path, reverse=True)
-        chosen = xlsx_items[0].path
-        name = Path(chosen).name
-        try:
-            return vs.download_bytes(chosen), name
-        except Exception as exc:
-            print(f"[send_email] Volume download failed for {chosen}: {exc}")
+    if run_id and proj:
+        run_base = vs.run_path(proj, run_id)
+        items = vs.list_dir(run_base)
+        print(f"[_find_workbook] Volume listing {run_base}: {len(items)} items")
+        xlsx_items = [
+            it for it in items
+            if it.path and it.path.endswith(".xlsx") and "_completed_" in it.path
+        ]
+        if xlsx_items:
+            xlsx_items.sort(key=lambda x: x.path, reverse=True)
+            chosen = xlsx_items[0].path
+            name = Path(chosen).name
+            try:
+                data = vs.download_bytes(chosen)
+                print(f"[_find_workbook] Downloaded from volume: {name} ({len(data)} bytes)")
+                return data, name
+            except Exception as exc:
+                print(f"[_find_workbook] Volume download failed for {chosen}: {exc}")
 
-    local_run = Path(PROJECTS_LOCAL_PATH) / proj / "runs" / run_id
-    if local_run.exists():
-        xlsx_files = sorted(local_run.glob("*_completed_*.xlsx"), reverse=True)
-        if xlsx_files:
-            return xlsx_files[0].read_bytes(), xlsx_files[0].name
+        local_run = Path(PROJECTS_LOCAL_PATH) / proj / "runs" / run_id
+        print(f"[_find_workbook] Checking local: {local_run} (exists={local_run.exists()})")
+        if local_run.exists():
+            xlsx_files = sorted(local_run.glob("*_completed_*.xlsx"), reverse=True)
+            if xlsx_files:
+                print(f"[_find_workbook] Found local: {xlsx_files[0].name}")
+                return xlsx_files[0].read_bytes(), xlsx_files[0].name
 
+    # Broad fallback: scan ALL local project dirs for the most recent completed workbook.
+    # Handles the case where thread context is lost (ToolNode ThreadPoolExecutor).
+    print("[_find_workbook] Broad fallback: scanning all local project directories")
+    all_xlsx: list[Path] = []
+    base = Path(PROJECTS_LOCAL_PATH)
+    if base.exists():
+        all_xlsx = sorted(base.rglob("*_completed_*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if all_xlsx:
+        chosen = all_xlsx[0]
+        print(f"[_find_workbook] Fallback found: {chosen.name} (mtime={chosen.stat().st_mtime})")
+        return chosen.read_bytes(), chosen.name
+
+    print("[_find_workbook] No workbook found anywhere")
     return None, ""
 
 
@@ -1115,6 +1154,7 @@ def _build_html_email(
             body_html_parts.append(f'<div style="padding:2px 0;color:#374151">{stripped}</div>')
 
     body_html = "\n".join(body_html_parts)
+    body_html = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body_html)
 
     report_section = ""
     if report_url:
@@ -1298,6 +1338,30 @@ def send_email(
 
 
 # =========================================================================
+# Plan announcement
+# =========================================================================
+
+@tool
+def announce_plan(steps: str) -> str:
+    """Announce the structured assessment plan to the user.
+
+    Call this ONCE, immediately after loading the engagement, to declare the
+    high-level steps you will follow. The frontend renders this as a live
+    checklist that updates as each phase completes.
+
+    Args:
+        steps: JSON array of plan steps. Each element must have:
+               - "id": short identifier (e.g. "load", "evidence", "test")
+               - "label": human-readable description of the phase
+               - "detail": (optional) extra context
+    Returns:
+        Confirmation JSON.
+    """
+    parsed = json.loads(steps)
+    return json.dumps({"status": "plan_announced", "step_count": len(parsed), "steps": parsed})
+
+
+# =========================================================================
 # User interaction
 # =========================================================================
 
@@ -1316,6 +1380,144 @@ def ask_user(question: str, options: Optional[str] = None) -> str:
     if options:
         result["suggested_options"] = [o.strip() for o in options.split(",")]
     return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic aggregation — removes LLM from pass/fail counting
+# ---------------------------------------------------------------------------
+
+_SAMPLE_ID_FIELDS = [
+    "JE_Number", "Order_No", "Location_ID", "User_ID", "Document_No",
+    "Inspection_ID", "Sample_No", "Row_No", "Location_Name",
+]
+
+
+def _extract_sample_id(sample: dict) -> str:
+    """Pull a human-readable ID from a sample item dict."""
+    for field in _SAMPLE_ID_FIELDS:
+        val = sample.get(field)
+        if val:
+            return str(val)
+    return json.dumps(sample, sort_keys=True)[:80]
+
+
+def _parse_llm_analysis(raw: str) -> dict:
+    """Robustly parse the JSON that execute_test's LLM returns."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`").lstrip("json").lstrip("\n")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"result": "Unknown", "narrative": raw[:500]}
+
+
+@tool
+def aggregate_test_results(
+    batch_results_json: str,
+) -> str:
+    """Deterministically aggregate per-sample test results into per-attribute summaries.
+
+    Takes the raw JSON output from batch_execute_tests and produces a
+    structured test_results_json array suitable for fill_workbook and
+    compile_results. Grouping, pass/fail determination, and exception
+    counting are all done in Python — no LLM judgment involved.
+
+    Rules:
+      - One entry per ref letter.
+      - A ref is "Pass" only if ALL its samples passed.
+      - A ref is "Fail" if ANY sample failed.
+      - A ref is "Not Applicable" only if ALL samples were N/A.
+      - Otherwise "Partial".
+      - Exceptions are merged into one per failing ref.
+
+    Args:
+        batch_results_json: The full JSON string returned by batch_execute_tests.
+
+    Returns:
+        JSON array of per-attribute results, ready for fill_workbook.
+    """
+    batch = json.loads(batch_results_json) if isinstance(batch_results_json, str) else batch_results_json
+    raw_results = batch.get("results", batch) if isinstance(batch, dict) else batch
+
+    by_ref: dict[str, dict] = {}
+
+    for entry in raw_results:
+        ref = entry.get("test_ref", "?").strip().upper()
+        sample = entry.get("sample_item", {})
+        if isinstance(sample, str):
+            try:
+                sample = json.loads(sample)
+            except json.JSONDecodeError:
+                sample = {}
+
+        parsed = _parse_llm_analysis(entry.get("llm_analysis", "{}"))
+        sample_id = _extract_sample_id(sample)
+        result_lower = parsed.get("result", "Unknown").strip().lower()
+
+        if ref not in by_ref:
+            by_ref[ref] = {
+                "results": [],
+                "narratives": [],
+                "sample_ids": [],
+                "exceptions": [],
+            }
+
+        bucket = by_ref[ref]
+        bucket["results"].append(result_lower)
+        bucket["narratives"].append(f"[{sample_id}]: {parsed.get('narrative', '')}")
+        bucket["sample_ids"].append(sample_id)
+
+        if result_lower == "fail":
+            bucket["exceptions"].append({
+                "description": parsed.get("exception") or parsed.get("narrative", "Test failed"),
+                "severity": parsed.get("severity", "Medium"),
+                "sample_id": sample_id,
+            })
+
+    aggregated = []
+    for ref in sorted(by_ref.keys()):
+        bucket = by_ref[ref]
+        results_set = set(bucket["results"])
+
+        if results_set == {"pass"}:
+            agg_result = "Pass"
+        elif "fail" in results_set:
+            agg_result = "Fail"
+        elif results_set <= {"not applicable"}:
+            agg_result = "Not Applicable"
+        else:
+            agg_result = "Partial"
+
+        merged_exceptions = []
+        if bucket["exceptions"]:
+            all_affected = sorted({e["sample_id"] for e in bucket["exceptions"]})
+            descriptions = []
+            severity = "Medium"
+            severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+            for exc in bucket["exceptions"]:
+                descriptions.append(exc["description"])
+                exc_sev = exc.get("severity", "Medium")
+                if severity_rank.get(exc_sev.lower(), 0) > severity_rank.get(severity.lower(), 0):
+                    severity = exc_sev
+
+            merged_exceptions = [{
+                "description": "; ".join(dict.fromkeys(descriptions)),
+                "severity": severity,
+                "affected_samples": all_affected,
+                "root_cause": "See test narrative",
+                "remediation": "Review and remediate",
+            }]
+
+        aggregated.append({
+            "ref": ref,
+            "result": agg_result,
+            "narrative": "\n".join(bucket["narratives"]),
+            "sample_items_tested": bucket["sample_ids"],
+            "exceptions": merged_exceptions,
+        })
+
+    return json.dumps(aggregated, indent=2)
 
 
 @tool
@@ -1445,34 +1647,63 @@ def fill_workbook(
                 break
 
         if issue_sheet:
+            def _cell_val(v):
+                if isinstance(v, list):
+                    return ", ".join(str(i) for i in v)
+                if isinstance(v, dict):
+                    return json.dumps(v)
+                return v
+
+            agg: dict[str, dict] = {}
+            for tr in test_results:
+                ref = tr.get("ref", "?").strip().upper()
+                if tr.get("result", "").lower() not in ("fail", "partial"):
+                    continue
+
+                exceptions = tr.get("exceptions", [])
+                raw_samples = tr.get("sample_items_tested", [])
+                if isinstance(raw_samples, str):
+                    raw_samples = [raw_samples]
+                samples_set = set(str(s) for s in raw_samples if s)
+
+                if ref not in agg:
+                    best_exc = exceptions[0] if exceptions else {}
+                    agg[ref] = {
+                        "description": best_exc.get("description", tr.get("narrative", "Test failed")),
+                        "severity": best_exc.get("severity", "Medium"),
+                        "samples": samples_set,
+                        "root_cause": best_exc.get("root_cause", "See test narrative"),
+                        "remediation": best_exc.get("remediation", "Review and remediate"),
+                        "owner": best_exc.get("owner", ""),
+                    }
+                else:
+                    entry = agg[ref]
+                    entry["samples"] |= samples_set
+                    for exc in exceptions:
+                        if exc.get("description"):
+                            entry["description"] = f"{entry['description']}; {exc['description']}"
+
             issue_counter = 1
             next_row = 3
-            for tr in test_results:
-                exceptions = tr.get("exceptions", [])
-                ref = tr.get("ref", "?")
-                if tr.get("result", "").lower() == "fail" and not exceptions:
-                    exceptions = [{
-                        "description": tr.get("narrative", "Test failed"),
-                        "severity": "Medium",
-                        "affected_samples": ", ".join(tr.get("sample_items_tested", [])),
-                        "root_cause": "See test narrative",
-                        "remediation": "Review and remediate",
-                    }]
-                for exc in exceptions:
-                    issue_id = f"ISS-{control_id or 'CTRL'}-{issue_counter:03d}"
-                    issue_sheet.cell(row=next_row, column=1, value=issue_id)
-                    issue_sheet.cell(row=next_row, column=2, value=ref)
-                    issue_sheet.cell(row=next_row, column=3, value=exc.get("severity", "Medium"))
-                    desc_cell = issue_sheet.cell(row=next_row, column=4, value=exc.get("description", ""))
-                    desc_cell.alignment = wrap_align
-                    issue_sheet.cell(row=next_row, column=5, value=exc.get("affected_samples", ""))
-                    issue_sheet.cell(row=next_row, column=6, value=exc.get("root_cause", ""))
-                    issue_sheet.cell(row=next_row, column=7, value=exc.get("remediation", ""))
-                    issue_sheet.cell(row=next_row, column=8, value=exc.get("owner", ""))
-                    issue_sheet.cell(row=next_row, column=9, value=exc.get("due_date", ""))
-                    issue_sheet.cell(row=next_row, column=10, value="Open")
-                    next_row += 1
-                    issue_counter += 1
+            for ref in sorted(agg.keys()):
+                entry = agg[ref]
+                issue_id = f"ISS-{control_id or 'CTRL'}-{issue_counter:03d}"
+                issue_sheet.cell(row=next_row, column=1, value=issue_id)
+                issue_sheet.cell(row=next_row, column=2, value=ref)
+                issue_sheet.cell(row=next_row, column=3, value=_cell_val(entry.get("severity", "Medium")))
+                desc_text = entry.get("description", "")
+                if len(desc_text) > 32000:
+                    desc_text = desc_text[:32000] + "..."
+                desc_cell = issue_sheet.cell(row=next_row, column=4, value=_cell_val(desc_text))
+                desc_cell.alignment = wrap_align
+                issue_sheet.cell(row=next_row, column=5, value=_cell_val(", ".join(sorted(entry.get("samples", set())))))
+                issue_sheet.cell(row=next_row, column=6, value=_cell_val(entry.get("root_cause", "")))
+                issue_sheet.cell(row=next_row, column=7, value=_cell_val(entry.get("remediation", "")))
+                issue_sheet.cell(row=next_row, column=8, value=_cell_val(entry.get("owner", "")))
+                issue_sheet.cell(row=next_row, column=9, value="")
+                issue_sheet.cell(row=next_row, column=10, value="Open")
+                next_row += 1
+                issue_counter += 1
 
             if issue_counter == 1:
                 issue_sheet.cell(row=3, column=1, value="No exceptions identified")
@@ -1525,10 +1756,8 @@ def fill_workbook(
 
         workbook_url = get_artifact_url(output_filename)
         attrs_filled = len(results_by_ref)
-        exceptions_count = sum(
-            len(tr.get("exceptions", []))
-            + (1 if tr.get("result", "").lower() == "fail" and not tr.get("exceptions") else 0)
-            for tr in test_results
+        exceptions_count = len(agg) if issue_sheet else sum(
+            1 for tr in test_results if tr.get("result", "").lower() in ("fail", "partial")
         )
 
         span.set_outputs({
@@ -1626,6 +1855,7 @@ def batch_review_evidence(
     from agent.run_context import snapshot_context, restore_context
 
     evidence_files = json.loads(evidence_files_json) if isinstance(evidence_files_json, str) else evidence_files_json
+    evidence_files = sorted(evidence_files, key=lambda f: f.get("path", ""))
     ctx_snapshot = snapshot_context()
 
     with mlflow.start_span(name="batch_review_evidence", span_type="TOOL") as parent_span:
@@ -1646,26 +1876,45 @@ def batch_review_evidence(
             restore_context(ctx_snapshot)
             label = Path(file_info.get("path", "")).stem
             try:
-                with mlflow.start_span(
-                    name=f"review_{file_info.get('type', 'doc')}_{label}",
-                    span_type="RETRIEVER",
-                    request_id=request_id,
-                ) as span:
-                    span.set_inputs({"file": file_info.get("path"), "type": file_info.get("type")})
-                    result = _dispatch_evidence_review(file_info, project_path, control_context)
-                    span.set_outputs({"analysis_length": len(result.get("analysis", ""))})
-                    return idx, result, ""
+                try:
+                    span_ctx = mlflow.start_span(
+                        name=f"review_{file_info.get('type', 'doc')}_{label}",
+                        span_type="RETRIEVER",
+                        request_id=request_id,
+                    )
+                    span_ctx.__enter__()
+                    span_ctx.set_inputs({"file": file_info.get("path"), "type": file_info.get("type")})
+                except Exception:
+                    span_ctx = None
+
+                result = _dispatch_evidence_review(file_info, project_path, control_context)
+
+                if span_ctx:
+                    try:
+                        span_ctx.set_outputs({"analysis_length": len(result.get("analysis", ""))})
+                        span_ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
+
+                return idx, result, ""
             except Exception as e:
+                import traceback
+                print(f"[batch_review] Worker {idx} error: {e}\n{traceback.format_exc()}")
                 return idx, None, f"{file_info.get('path', '?')}: {e}"
 
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_EVIDENCE) as pool:
             futures = {pool.submit(_worker, i, f): i for i, f in enumerate(evidence_files)}
+            done_count = 0
             for future in as_completed(futures):
                 idx, result, error = future.result()
                 if result:
                     reviews[idx] = result
                 if error:
                     errors.append(error)
+                done_count += 1
+                from agent.run_context import report_progress
+                fname = evidence_files[idx].get("path", "").split("/")[-1] if idx < len(evidence_files) else ""
+                report_progress(done_count, len(evidence_files), fname)
 
         elapsed = round(_time.time() - start, 1)
         reviews = [r for r in reviews if r is not None]
@@ -1711,6 +1960,7 @@ def batch_execute_tests(
     from agent.run_context import snapshot_context, restore_context
 
     test_plan = json.loads(test_plan_json) if isinstance(test_plan_json, str) else test_plan_json
+    test_plan = sorted(test_plan, key=lambda e: (e.get("test_ref", ""), e.get("sample_item_json", "")))
     ctx_snapshot = snapshot_context()
 
     with mlflow.start_span(name="batch_execute_tests", span_type="TOOL") as parent_span:
@@ -1730,38 +1980,53 @@ def batch_execute_tests(
             restore_context(ctx_snapshot)
             ref = entry.get("test_ref", "?")
             try:
-                with mlflow.start_span(
-                    name=f"test_{ref}_{idx}",
-                    span_type="TOOL",
-                    request_id=request_id,
-                ) as span:
-                    span.set_inputs({
+                try:
+                    span_ctx = mlflow.start_span(
+                        name=f"test_{ref}_{idx}",
+                        span_type="TOOL",
+                        request_id=request_id,
+                    )
+                    span_ctx.__enter__()
+                    span_ctx.set_inputs({
                         "ref": ref,
                         "attribute": entry.get("attribute", ""),
                         "sample_item": entry.get("sample_item_json", "")[:200],
                     })
-                    result = _execute_single_test(entry, control_context, evidence_summary)
-                    # Parse the LLM analysis to extract pass/fail
-                    llm_result = "unknown"
+                except Exception:
+                    span_ctx = None
+
+                result = _execute_single_test(entry, control_context, evidence_summary)
+
+                if span_ctx:
                     try:
+                        llm_result = "unknown"
                         analysis = result.get("llm_analysis", "")
                         parsed = json.loads(analysis.strip().strip("`").lstrip("json\n"))
                         llm_result = parsed.get("result", "unknown")
+                        span_ctx.set_outputs({"result": llm_result})
+                        span_ctx.__exit__(None, None, None)
                     except Exception:
                         pass
-                    span.set_outputs({"result": llm_result})
-                    return idx, result, ""
+
+                return idx, result, ""
             except Exception as e:
+                import traceback
+                print(f"[batch_tests] Worker {idx} error: {e}\n{traceback.format_exc()}")
                 return idx, None, f"Test {ref} #{idx}: {e}"
 
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TESTS) as pool:
             futures = {pool.submit(_worker, i, e): i for i, e in enumerate(test_plan)}
+            done_count = 0
             for future in as_completed(futures):
                 idx, result, error = future.result()
                 if result:
                     results[idx] = result
                 if error:
                     errors.append(error)
+                done_count += 1
+                from agent.run_context import report_progress
+                ref = test_plan[idx].get("test_ref", "") if idx < len(test_plan) else ""
+                report_progress(done_count, len(test_plan), ref)
 
         elapsed = round(_time.time() - start, 1)
         results = [r for r in results if r is not None]
@@ -1810,21 +2075,3 @@ def batch_execute_tests(
     }, indent=2)
 
 
-ALL_TOOLS = [
-    list_projects,
-    load_engagement,
-    parse_workbook,
-    extract_workbook_images,
-    batch_review_evidence,
-    batch_execute_tests,
-    review_document,
-    review_screenshot,
-    analyze_email,
-    generate_test_plan,
-    execute_test,
-    compile_results,
-    fill_workbook,
-    save_report,
-    send_email,
-    ask_user,
-]

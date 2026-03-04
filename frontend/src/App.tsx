@@ -1,22 +1,16 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
-  sendMessage, cancelTask, uploadFile, listProjects, listRuns, pollTask,
-  AgentMessage, UploadResult, ProjectInfo, ToolStep, SendResult, RunInfo,
+  sendMessage, cancelTask, listProjects, listRuns, pollTask, fetchRunManifest,
+  AgentMessage, ProjectInfo, ToolStep, SendResult, RunInfo,
+  ThinkingEntry, AgentPlan,
 } from "./api";
-import ChatMessage from "./components/ChatMessage";
-import FileUpload from "./components/FileUpload";
 import ExecutionPanel from "./components/ExecutionPanel";
+import ThinkingPanel, { type TimelineEntry } from "./components/ThinkingPanel";
+import ProjectDashboard from "./components/ProjectDashboard";
+
+type AppView = "welcome" | "project" | "run";
 
 const SESSION_KEY = "gsk_agent_state";
-
-const INITIAL_MESSAGE: AgentMessage = {
-  role: "assistant",
-  content:
-    "Welcome to the **GSK Controls Evidence Review Agent**.\n\n" +
-    "Select a project from the sidebar to begin a control review, or type a question below.\n\n" +
-    "I'll load the engagement instructions, parse the workbook, review all evidence, " +
-    "execute each test attribute, and compile a full audit report.",
-};
 
 const DOMAIN_COLORS: Record<string, string> = {
   "Accounts Payable": "#2563eb",
@@ -25,30 +19,10 @@ const DOMAIN_COLORS: Record<string, string> = {
   "HR / IT Controls": "#d97706",
   "Revenue / Financial Reporting": "#dc2626",
   "Environmental Health & Safety": "#0891b2",
+  "Inventory Management": "#7c3aed",
 };
-
-const EVIDENCE_ICONS: Record<string, { icon: string; label: string; color: string }> = {
-  pdf: { icon: "PDF", label: "PDF", color: "#dc3545" },
-  screenshot: { icon: "SCR", label: "Screenshot", color: "#7c3aed" },
-  email: { icon: "EML", label: "Email", color: "#2563eb" },
-  photo: { icon: "IMG", label: "Photo", color: "#059669" },
-  embedded_image: { icon: "EMB", label: "Embedded", color: "#0891b2" },
-};
-
-function getProjectEvidenceTypes(proj: ProjectInfo): string[] {
-  const domainMap: Record<string, string[]> = {
-    "Accounts Payable": ["pdf"],
-    "IT General Controls": ["screenshot", "pdf"],
-    "Financial Reporting": ["email", "pdf"],
-    "HR / IT Controls": ["screenshot", "pdf"],
-    "Revenue / Financial Reporting": ["photo", "pdf"],
-    "Environmental Health & Safety": ["embedded_image", "pdf"],
-  };
-  return domainMap[proj.domain || ""] || ["pdf"];
-}
 
 interface PersistedState {
-  messages: AgentMessage[];
   selectedProject: string | null;
   activeTaskId: string | null;
   currentRunId: string;
@@ -72,17 +46,29 @@ function loadPersistedState(): PersistedState | null {
 function savePersistedState(state: PersistedState) {
   try {
     sessionStorage.setItem(SESSION_KEY, JSON.stringify(state));
-  } catch { /* quota exceeded — ignore */ }
+  } catch { /* quota exceeded */ }
+}
+
+function requestNotificationPermission() {
+  if ("Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission();
+  }
+}
+
+function fireCompletionNotification(projectDir: string, assessment: string) {
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("Assessment Complete", {
+      body: `${projectDir}: ${assessment || "Completed"}`,
+      icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>",
+    });
+  }
 }
 
 export default function App() {
   const persisted = useRef(loadPersistedState());
   const init = persisted.current;
 
-  const [messages, setMessages] = useState<AgentMessage[]>(init?.messages || [INITIAL_MESSAGE]);
-  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(!!init?.activeTaskId);
-  const [uploadedFiles, setUploadedFiles] = useState<UploadResult[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProject, setSelectedProject] = useState<string | null>(init?.selectedProject ?? null);
 
@@ -95,17 +81,25 @@ export default function App() {
   const [currentProjectDir, setCurrentProjectDir] = useState(init?.currentProjectDir ?? "");
   const [activeTaskId, setActiveTaskId] = useState<string | null>(init?.activeTaskId ?? null);
   const [cancelling, setCancelling] = useState(false);
+  const [wasCancelled, setWasCancelled] = useState(false);
   const latestStepsRef = useRef<ToolStep[]>(init?.liveSteps || []);
   const abortRef = useRef<AbortController | null>(null);
 
+  const [thinking, setThinking] = useState<ThinkingEntry[]>([]);
+  const [plan, setPlan] = useState<AgentPlan | null>(null);
+  const [userMessages, setUserMessages] = useState<TimelineEntry[]>([]);
+  const [appView, setAppView] = useState<AppView>(
+    init?.activeTaskId ? "run" : init?.selectedProject ? "project" : "welcome"
+  );
+
   const [projectRunCounts, setProjectRunCounts] = useState<Record<string, { count: number; lastStatus: string }>>({});
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    requestNotificationPermission();
+  }, []);
 
-  // Persist state on every meaningful update
   useEffect(() => {
     savePersistedState({
-      messages,
       selectedProject,
       activeTaskId,
       currentRunId,
@@ -115,20 +109,11 @@ export default function App() {
       runComplete,
       loading,
     });
-  }, [messages, selectedProject, activeTaskId, currentRunId, currentProjectDir, liveSteps, completedSteps, runComplete, loading]);
-
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, []);
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, scrollToBottom]);
+  }, [selectedProject, activeTaskId, currentRunId, currentProjectDir, liveSteps, completedSteps, runComplete, loading]);
 
   useEffect(() => {
     listProjects().then((projs) => {
       setProjects(projs);
-      // Fetch run counts for sidebar indicators
       projs.forEach((p) => {
         listRuns(p.project_dir).then((runs) => {
           if (runs.length > 0) {
@@ -145,7 +130,6 @@ export default function App() {
     });
   }, []);
 
-  // Resume polling if page was refreshed while a task was in-flight
   useEffect(() => {
     const taskId = init?.activeTaskId;
     if (!taskId) return;
@@ -163,17 +147,11 @@ export default function App() {
       },
       controller.signal,
     ).then((result) => {
-      setMessages((prev) => [...prev, result.message]);
       setCompletedSteps(latestStepsRef.current);
       setRunComplete(true);
       if (result.runId) setCurrentRunId(result.runId);
       if (result.projectDir) setCurrentProjectDir(result.projectDir);
-    }).catch((error) => {
-      const msg = error instanceof Error ? error.message : "Unknown error";
-      const isCancelled = msg === "Cancelled" || msg.includes("cancelled") || msg.includes("abort");
-      if (!isCancelled) {
-        setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${msg}` }]);
-      }
+    }).catch(() => {
       setCompletedSteps(latestStepsRef.current);
       setRunComplete(true);
     }).finally(() => {
@@ -186,14 +164,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleSend = async (overrideInput?: string) => {
-    const text = overrideInput || input;
+  const handleSend = useCallback(async (text: string) => {
     if (!text.trim() || loading) return;
-
-    const userMsg: AgentMessage = { role: "user", content: text };
-    const allMessages = [...messages, userMsg];
-    setMessages(allMessages);
-    setInput("");
+    setAppView("run");
     setLoading(true);
     setCancelling(false);
     setActiveTaskId(null);
@@ -202,14 +175,20 @@ export default function App() {
     setLiveElapsed(0);
     setCompletedSteps([]);
     setRunComplete(false);
+    setWasCancelled(false);
+    setThinking([]);
+    setPlan(null);
+    setUserMessages([]);
     latestStepsRef.current = [];
 
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const msgs: AgentMessage[] = [{ role: "user", content: text }];
+
     try {
       const result: SendResult = await sendMessage(
-        allMessages.filter((m) => m !== INITIAL_MESSAGE),
+        msgs,
         (steps, currentStep, elapsed) => {
           const snapshot = [...steps];
           setLiveSteps(snapshot);
@@ -219,24 +198,17 @@ export default function App() {
         },
         (taskId) => setActiveTaskId(taskId),
         controller.signal,
+        (newThinking, newPlan) => {
+          setThinking(newThinking);
+          if (newPlan) setPlan(newPlan);
+        },
       );
-      setMessages((prev) => [...prev, result.message]);
       setCompletedSteps(latestStepsRef.current);
       setRunComplete(true);
       if (result.runId) setCurrentRunId(result.runId);
       if (result.projectDir) setCurrentProjectDir(result.projectDir);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : "Unknown error";
-      const isCancelled = msg === "Cancelled" || msg.includes("cancelled") || msg.includes("abort");
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: isCancelled
-            ? "Run stopped by user."
-            : `Error: ${msg}. Please check the backend is running.`,
-        },
-      ]);
+      fireCompletionNotification(result.projectDir || selectedProject || "", "Assessment complete");
+    } catch {
       setCompletedSteps(latestStepsRef.current);
       setRunComplete(true);
     } finally {
@@ -246,64 +218,54 @@ export default function App() {
       setLiveCurrentStep(null);
       abortRef.current = null;
     }
-  };
+  }, [loading, selectedProject]);
 
   const handleStop = async () => {
     if (!activeTaskId) return;
     setCancelling(true);
-    try {
-      await cancelTask(activeTaskId);
-    } catch { /* best effort */ }
+    setWasCancelled(true);
+    try { await cancelTask(activeTaskId); } catch { /* best effort */ }
     abortRef.current?.abort();
-  };
-
-  const handleFileUpload = async (files: File[]) => {
-    for (const file of files) {
-      try {
-        const result = await uploadFile(file);
-        setUploadedFiles((prev) => [...prev, result]);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `Uploaded **${result.filename}** (${(result.size_bytes / 1024).toFixed(1)} KB)${result.volume_path ? ` to UC Volume: \`${result.volume_path}\`` : " to local staging"}`,
-          },
-        ]);
-      } catch (error) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `Failed to upload ${file.name}: ${error instanceof Error ? error.message : "Unknown error"}`,
-          },
-        ]);
-      }
-    }
   };
 
   const handleStartOver = () => {
     if (loading) return;
-    setMessages([INITIAL_MESSAGE]);
-    setInput("");
     setSelectedProject(null);
     setLiveSteps([]);
     setLiveCurrentStep(null);
     setLiveElapsed(0);
     setCompletedSteps([]);
     setRunComplete(false);
+    setWasCancelled(false);
     setCurrentRunId("");
     setCurrentProjectDir("");
     setActiveTaskId(null);
     setCancelling(false);
-    setUploadedFiles([]);
+    setThinking([]);
+    setPlan(null);
+    setUserMessages([]);
+    setAppView("welcome");
     abortRef.current = null;
     sessionStorage.removeItem(SESSION_KEY);
   };
 
   const handleProjectSelect = (proj: ProjectInfo) => {
+    if (loading) return;
     setSelectedProject(proj.project_dir);
     setCompletedSteps([]);
     setRunComplete(false);
+    setWasCancelled(false);
+    setCurrentRunId("");
+    setCurrentProjectDir(proj.project_dir);
+    setThinking([]);
+    setPlan(null);
+    setUserMessages([]);
+    setAppView("project");
+  };
+
+  const handleRunAssessment = useCallback(() => {
+    const proj = projects.find((p) => p.project_dir === selectedProject);
+    if (!proj || loading) return;
     handleSend(
       `Run the full controls evidence review for project "${proj.project_dir}" ` +
       `(Control ${proj.control_id}: ${proj.control_name}). ` +
@@ -311,7 +273,81 @@ export default function App() {
       `execute all applicable tests, compile the results, save the report, ` +
       `and email the report if notification_emails is configured.`
     );
-  };
+  }, [projects, selectedProject, loading, handleSend]);
+
+  const handleViewHistoryRun = useCallback(async (run: RunInfo) => {
+    const projDir = selectedProject || "";
+    if (!projDir) return;
+    const manifest = await fetchRunManifest(projDir, run.run_id);
+    if (manifest) {
+      setCompletedSteps(manifest.steps || []);
+      setThinking(manifest.thinking || []);
+      setPlan(manifest.plan || null);
+      setCurrentRunId(manifest.run_id);
+      setCurrentProjectDir(projDir);
+      setRunComplete(true);
+      setWasCancelled(manifest.status === "cancelled" || manifest.status === "stopped");
+      setUserMessages([]);
+      setAppView("run");
+    }
+  }, [selectedProject]);
+
+  const handleContinueRun = useCallback(async (run: RunInfo) => {
+    const projDir = selectedProject || "";
+    if (!projDir || loading) return;
+    const proj = projects.find((p) => p.project_dir === projDir);
+    if (!proj) return;
+
+    const manifest = await fetchRunManifest(projDir, run.run_id);
+    let stepsSummary = "";
+    if (manifest?.steps) {
+      const completed = manifest.steps.filter((s: ToolStep) => s.status === "complete");
+      stepsSummary = completed
+        .map((s: ToolStep) => `- ${s.label}: ${(s.result_summary || "done").slice(0, 120)}`)
+        .join("\n");
+    }
+
+    handleSend(
+      `Continue the controls evidence review for project "${projDir}" ` +
+      `(Control ${proj.control_id}: ${proj.control_name}). ` +
+      `A previous run (${run.run_id}) was stopped after completing these steps:\n${stepsSummary}\n\n` +
+      `Resume from where it left off. Load the engagement, then skip steps already completed above. ` +
+      `Execute any remaining tests, compile results, save the report, and email if configured.`
+    );
+  }, [selectedProject, projects, loading, handleSend]);
+
+  const handleContinueCurrentRun = useCallback(() => {
+    const proj = projects.find((p) => p.project_dir === selectedProject);
+    if (!proj || loading) return;
+
+    const completed = completedSteps.filter((s) => s.status === "complete");
+    const stepsSummary = completed
+      .map((s) => `- ${s.label}: ${(s.result_summary || "done").slice(0, 120)}`)
+      .join("\n");
+
+    handleSend(
+      `Continue the controls evidence review for project "${selectedProject}" ` +
+      `(Control ${proj.control_id}: ${proj.control_name}). ` +
+      `The previous run was stopped after completing these steps:\n${stepsSummary}\n\n` +
+      `Resume from where it left off. Load the engagement, then skip steps already completed above. ` +
+      `Execute any remaining tests, compile results, save the report, and email if configured.`
+    );
+  }, [selectedProject, projects, loading, completedSteps, handleSend]);
+
+  const handleBackToProject = useCallback(() => {
+    if (loading) return;
+    setLiveSteps([]);
+    setLiveCurrentStep(null);
+    setLiveElapsed(0);
+    setCompletedSteps([]);
+    setRunComplete(false);
+    setWasCancelled(false);
+    setCurrentRunId("");
+    setThinking([]);
+    setPlan(null);
+    setUserMessages([]);
+    setAppView("project");
+  }, [loading]);
 
   const handleRerunTest = (projDir: string, ref: string, attribute: string) => {
     if (loading) return;
@@ -333,15 +369,13 @@ export default function App() {
     );
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
+  const handleThinkingPanelSend = useCallback((text: string) => {
+    if (!text.trim()) return;
+    setUserMessages((prev) => [...prev, { type: "user", content: text, timestamp: Date.now() / 1000 }]);
+    handleSend(text);
+  }, [handleSend]);
 
   const activeSteps = loading ? liveSteps : completedSteps;
-  const showPanel = activeSteps.length > 0 || selectedProject !== null;
   const selectedProjectInfo = projects.find((p) => p.project_dir === selectedProject) || null;
 
   return (
@@ -354,14 +388,11 @@ export default function App() {
         </div>
 
         <div style={styles.projectSection}>
-          <h4 style={styles.sectionTitle}>
-            Projects ({projects.length})
-          </h4>
+          <h4 style={styles.sectionTitle}>Projects ({projects.length})</h4>
           {projects.length === 0 && (
             <div style={styles.emptyText}>Loading projects...</div>
           )}
           {projects.map((proj) => {
-            const evidenceTypes = getProjectEvidenceTypes(proj);
             const isSelected = selectedProject === proj.project_dir;
             const runInfo = projectRunCounts[proj.project_dir];
             const isRunningNow = isSelected && loading;
@@ -372,7 +403,7 @@ export default function App() {
                   ...styles.projectCard,
                   ...(isSelected ? styles.projectCardActive : {}),
                 }}
-                onClick={() => !loading && handleProjectSelect(proj)}
+                onClick={() => handleProjectSelect(proj)}
               >
                 <div style={styles.projectHeader}>
                   <span
@@ -388,7 +419,7 @@ export default function App() {
                     {!isRunningNow && runInfo && (
                       <>
                         <span style={{
-                          ...styles.statusIndicator,
+                          ...styles.statusDot,
                           background: runInfo.lastStatus === "complete" ? "#10b981"
                             : runInfo.lastStatus === "error" ? "#ef4444" : "#9ca3af",
                         }} />
@@ -401,170 +432,129 @@ export default function App() {
                   {proj.control_name || proj.project_dir}
                 </div>
                 <div style={styles.projectDomain}>{proj.domain || ""}</div>
-                <div style={styles.evidenceRow}>
-                  {evidenceTypes.map((t) => {
-                    const info = EVIDENCE_ICONS[t];
-                    if (!info) return null;
-                    return (
-                      <span
-                        key={t}
-                        style={{ ...styles.evidenceChip, borderColor: info.color, color: info.color }}
-                        title={info.label}
-                      >
-                        {info.icon}
-                      </span>
-                    );
-                  })}
-                </div>
               </div>
             );
           })}
         </div>
 
-        {uploadedFiles.length > 0 && (
-          <div style={styles.uploadSection}>
-            <h4 style={styles.sectionTitle}>Uploaded Files</h4>
-            {uploadedFiles.map((f, i) => (
-              <div key={i} style={styles.fileItem}>
-                <span style={styles.fileName}>{f.filename}</span>
-              </div>
-            ))}
-          </div>
-        )}
-
         <div style={styles.sidebarFooter}>
-          <span style={{ fontSize: 10, opacity: 0.4 }}>
-            Powered by Databricks
-          </span>
+          <span style={{ fontSize: 10, opacity: 0.4 }}>Powered by Databricks</span>
         </div>
       </aside>
 
-      {/* Center: Chat */}
+      {/* Main Area */}
       <main style={styles.main}>
-        <header style={styles.header}>
-          <h1 style={styles.headerTitle}>Controls Evidence Review</h1>
-          {selectedProject && (
-            <div style={styles.headerBadge}>
-              {projects.find((p) => p.project_dir === selectedProject)?.control_id || selectedProject}
-            </div>
-          )}
-          <div style={{ flex: 1 }} />
-          {loading && (
-            <div style={styles.headerRunning}>
-              <span style={styles.headerDot} />
-              {cancelling ? "Stopping..." : "Agent working..."}
-              {loading && !cancelling && (
-                <button style={styles.stopButtonSmall} onClick={handleStop} title="Stop agent">
-                  Stop
+        {appView === "run" ? (
+          <>
+            {/* Back to project nav */}
+            {!loading && selectedProjectInfo && (
+              <div style={styles.backNav}>
+                <button style={styles.backBtn} onClick={handleBackToProject}>
+                  ← Back to {selectedProjectInfo.control_id || selectedProjectInfo.project_dir}
                 </button>
-              )}
-            </div>
-          )}
-          {!loading && messages.length > 1 && (
-            <button style={styles.startOverButton} onClick={handleStartOver} title="Start a new review">
-              Start Over
-            </button>
-          )}
-        </header>
-
-        <div style={styles.chatContainer}>
-          <div style={styles.messagesArea}>
-            {messages.map((msg, i) => (
-              <ChatMessage key={i} message={msg} />
-            ))}
-            <div ref={messagesEndRef} />
-          </div>
-        </div>
-
-        <div style={styles.inputArea}>
-          {messages.length <= 1 && !loading && (
-            <div style={styles.quickActions}>
-              <button
-                style={styles.quickActionBtn}
-                onClick={() => {
-                  handleSend("List all available projects and give me a summary of each control.");
-                }}
-              >
-                List Projects
-              </button>
-              <button
-                style={styles.quickActionBtn}
-                onClick={() => {
-                  handleSend(
-                    "Run the full controls evidence review for ALL 6 projects. " +
-                    "For each project: load the engagement, parse the workbook, " +
-                    "review evidence (including any embedded images), execute tests, " +
-                    "compile results, save the report, and email if configured."
-                  );
-                }}
-              >
-                Run All Reviews
-              </button>
-              {projects.slice(0, 6).map((proj) => (
-                <button
-                  key={proj.project_dir}
-                  style={{
-                    ...styles.quickActionBtnSecondary,
-                    borderColor: DOMAIN_COLORS[proj.domain || ""] || "#6b7280",
-                    color: DOMAIN_COLORS[proj.domain || ""] || "#6b7280",
-                  }}
-                  onClick={() => handleProjectSelect(proj)}
-                >
-                  {proj.control_id || proj.project_dir}
-                </button>
-              ))}
-            </div>
-          )}
-          <FileUpload onUpload={handleFileUpload} />
-          <div style={styles.inputRow}>
-            <textarea
-              style={styles.textarea}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask the agent to review controls, execute tests, or generate a report..."
-              rows={1}
-              disabled={loading}
-            />
-            {loading ? (
-              <button
-                style={styles.stopButton}
-                onClick={handleStop}
-                disabled={cancelling}
-              >
-                {cancelling ? "Stopping..." : "Stop"}
-              </button>
-            ) : (
-              <button
-                style={{
-                  ...styles.sendButton,
-                  opacity: !input.trim() ? 0.5 : 1,
-                }}
-                onClick={() => handleSend()}
-                disabled={!input.trim()}
-              >
-                Send
-              </button>
+                {currentRunId && (
+                  <span style={styles.backRunId}>Run: {currentRunId}</span>
+                )}
+              </div>
             )}
+            <div style={styles.splitContainer}>
+              <div style={styles.thinkingPane}>
+                <ThinkingPanel
+                  thinking={thinking}
+                  plan={plan}
+                  isRunning={loading}
+                  isComplete={runComplete}
+                  steps={activeSteps}
+                  onSendMessage={handleThinkingPanelSend}
+                  disabled={loading}
+                  userMessages={userMessages}
+                />
+              </div>
+              <div style={styles.splitDivider} />
+              <div style={styles.executionPane}>
+                <ExecutionPanel
+                  project={selectedProjectInfo}
+                  steps={activeSteps}
+                  currentStep={liveCurrentStep}
+                  elapsed={liveElapsed}
+                  isRunning={loading}
+                  isComplete={runComplete}
+                  runId={currentRunId}
+                  projectDir={currentProjectDir || selectedProject || ""}
+                  cancelling={cancelling}
+                  onRerunTest={handleRerunTest}
+                  onReviewEvidence={handleReviewEvidence}
+                  onStop={handleStop}
+                  onStartOver={handleStartOver}
+                  onContinue={wasCancelled ? handleContinueCurrentRun : undefined}
+                  wasCancelled={wasCancelled}
+                />
+              </div>
+            </div>
+          </>
+        ) : appView === "project" && selectedProjectInfo ? (
+          <ProjectDashboard
+            project={selectedProjectInfo}
+            onRunAssessment={handleRunAssessment}
+            onViewRun={handleViewHistoryRun}
+            onContinueRun={handleContinueRun}
+          />
+        ) : (
+          /* Welcome state */
+          <div style={styles.welcomeContainer}>
+            <div style={styles.welcomeHero}>
+              <div style={styles.welcomeIcon}>🛡️</div>
+              <h1 style={styles.welcomeTitle}>Controls Evidence Review</h1>
+              <p style={styles.welcomeSubtitle}>
+                Select a project to view its run history or start a new automated control review.
+              </p>
+            </div>
+            <div style={styles.welcomeGrid}>
+              {projects.map((proj) => {
+                const runInfo = projectRunCounts[proj.project_dir];
+                return (
+                  <div
+                    key={proj.project_dir}
+                    style={styles.welcomeCard}
+                    onClick={() => handleProjectSelect(proj)}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLDivElement).style.borderColor = DOMAIN_COLORS[proj.domain || ""] || "#6b7280";
+                      (e.currentTarget as HTMLDivElement).style.transform = "translateY(-2px)";
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLDivElement).style.borderColor = "#e5e7eb";
+                      (e.currentTarget as HTMLDivElement).style.transform = "translateY(0)";
+                    }}
+                  >
+                    <div style={styles.welcomeCardHeader}>
+                      <span
+                        style={{
+                          ...styles.welcomeControlBadge,
+                          background: DOMAIN_COLORS[proj.domain || ""] || "#6b7280",
+                        }}
+                      >
+                        {proj.control_id || proj.project_dir}
+                      </span>
+                      {runInfo && (
+                        <span style={{
+                          ...styles.welcomeRunBadge,
+                          background: runInfo.lastStatus === "complete" ? "#ecfdf5" : "#f3f4f6",
+                          color: runInfo.lastStatus === "complete" ? "#059669" : "#6b7280",
+                        }}>
+                          {runInfo.count} run{runInfo.count !== 1 ? "s" : ""}
+                        </span>
+                      )}
+                    </div>
+                    <div style={styles.welcomeCardName}>{proj.control_name || proj.project_dir}</div>
+                    <div style={styles.welcomeCardDomain}>{proj.domain || ""}</div>
+                    <div style={styles.welcomeCardAction}>View Project →</div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
+        )}
       </main>
-
-      {/* Right Panel: Execution Trace */}
-      {showPanel && (
-        <ExecutionPanel
-          project={selectedProjectInfo}
-          steps={activeSteps}
-          currentStep={liveCurrentStep}
-          elapsed={liveElapsed}
-          isRunning={loading}
-          isComplete={runComplete}
-          runId={currentRunId}
-          projectDir={currentProjectDir || selectedProject || ""}
-          onRerunTest={handleRerunTest}
-          onReviewEvidence={handleReviewEvidence}
-        />
-      )}
     </div>
   );
 }
@@ -574,9 +564,12 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     height: "100vh",
     overflow: "hidden",
+    background: "#f3f4f6",
   },
+
+  /* Sidebar */
   sidebar: {
-    width: 260,
+    width: 270,
     background: "#1a1a2e",
     color: "#fff",
     display: "flex",
@@ -654,7 +647,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: "50%",
     animation: "spin 0.8s linear infinite",
   },
-  statusIndicator: {
+  statusDot: {
     width: 7,
     height: 7,
     borderRadius: "50%",
@@ -679,187 +672,157 @@ const styles: Record<string, React.CSSProperties> = {
   projectDomain: {
     fontSize: 10,
     opacity: 0.4,
-    marginBottom: 3,
-  },
-  evidenceRow: {
-    display: "flex",
-    gap: 4,
-    marginTop: 3,
-  },
-  evidenceChip: {
-    fontSize: 7,
-    fontWeight: 700,
-    padding: "1px 4px",
-    borderRadius: 3,
-    border: "1px solid",
-    letterSpacing: 0.3,
-  },
-  uploadSection: {
-    padding: "10px 14px",
-    borderTop: "1px solid rgba(255,255,255,0.08)",
-  },
-  fileItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "3px 0",
-    fontSize: 11,
-    opacity: 0.7,
-  },
-  fileName: {
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap" as const,
   },
   sidebarFooter: {
     padding: "10px 18px",
     borderTop: "1px solid rgba(255,255,255,0.08)",
     textAlign: "center" as const,
   },
+
+  /* Main area */
   main: {
     flex: 1,
     display: "flex",
     flexDirection: "column",
     overflow: "hidden",
     minWidth: 0,
+    position: "relative" as const,
   },
-  header: {
-    padding: "12px 24px",
-    background: "#fff",
-    borderBottom: "1px solid #e5e7eb",
+
+  /* Back navigation */
+  backNav: {
     display: "flex",
     alignItems: "center",
     gap: 12,
+    padding: "8px 16px",
+    borderBottom: "1px solid #e5e7eb",
+    background: "#fff",
     flexShrink: 0,
   },
-  headerTitle: {
-    fontSize: 17,
-    fontWeight: 700,
-    color: "#111827",
-  },
-  headerBadge: {
-    background: "#f36f21",
-    color: "#fff",
-    padding: "2px 10px",
-    borderRadius: 10,
-    fontSize: 11,
-    fontWeight: 700,
-  },
-  headerRunning: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
+  backBtn: {
+    padding: "4px 12px",
+    border: "1px solid #d1d5db",
+    borderRadius: 6,
+    background: "#fff",
     fontSize: 12,
-    color: "#ea580c",
-    fontWeight: 500,
+    fontWeight: 600,
+    color: "#374151",
+    cursor: "pointer",
+    transition: "background 0.15s",
   },
-  headerDot: {
-    width: 6,
-    height: 6,
-    borderRadius: "50%",
-    background: "#f36f21",
-    animation: "pulse 1.5s infinite",
+  backRunId: {
+    fontSize: 11,
+    color: "#9ca3af",
+    fontFamily: "monospace",
   },
-  chatContainer: {
+
+  /* Split pane layout */
+  splitContainer: {
     flex: 1,
     display: "flex",
     overflow: "hidden",
+    minHeight: 0,
   },
-  messagesArea: {
-    flex: 1,
-    overflow: "auto",
-    padding: "20px 24px",
+  thinkingPane: {
+    width: "33%",
+    minWidth: 280,
+    maxWidth: 420,
+    flexShrink: 0,
+    overflow: "hidden",
   },
-  inputArea: {
-    padding: "10px 24px 14px",
-    background: "#fff",
-    borderTop: "1px solid #e5e7eb",
+  splitDivider: {
+    width: 1,
+    background: "#e5e7eb",
     flexShrink: 0,
   },
-  inputRow: {
-    display: "flex",
-    gap: 8,
-    alignItems: "flex-end",
-  },
-  textarea: {
+  executionPane: {
     flex: 1,
-    padding: "10px 14px",
-    border: "1px solid #d1d5db",
-    borderRadius: 8,
-    fontSize: 14,
-    resize: "none" as const,
-    fontFamily: "inherit",
-    outline: "none",
-    minHeight: 42,
-    maxHeight: 120,
-  },
-  sendButton: {
-    padding: "10px 20px",
-    background: "#f36f21",
-    color: "#fff",
-    border: "none",
-    borderRadius: 8,
-    fontSize: 14,
-    fontWeight: 600,
-    cursor: "pointer",
-    whiteSpace: "nowrap" as const,
-  },
-  stopButton: {
-    padding: "10px 20px",
-    background: "#dc2626",
-    color: "#fff",
-    border: "none",
-    borderRadius: 8,
-    fontSize: 14,
-    fontWeight: 600,
-    cursor: "pointer",
-    whiteSpace: "nowrap" as const,
-  },
-  stopButtonSmall: {
-    padding: "2px 10px",
-    marginLeft: 8,
-    background: "#dc2626",
-    color: "#fff",
-    border: "none",
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  startOverButton: {
-    padding: "6px 14px",
-    background: "#fff",
-    color: "#6b7280",
-    border: "1px solid #d1d5db",
-    borderRadius: 8,
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-    transition: "all 0.15s",
-  },
-  quickActions: {
+    overflow: "hidden",
     display: "flex",
-    gap: 6,
-    marginBottom: 10,
-    flexWrap: "wrap" as const,
+    flexDirection: "column",
+    minWidth: 0,
   },
-  quickActionBtn: {
-    padding: "7px 14px",
-    background: "#f36f21",
+
+  /* Welcome state */
+  welcomeContainer: {
+    flex: 1,
+    overflow: "auto",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    padding: "48px 32px",
+  },
+  welcomeHero: {
+    textAlign: "center" as const,
+    marginBottom: 40,
+    maxWidth: 560,
+  },
+  welcomeIcon: {
+    fontSize: 48,
+    marginBottom: 12,
+  },
+  welcomeTitle: {
+    fontSize: 28,
+    fontWeight: 800,
+    color: "#111827",
+    marginBottom: 10,
+  },
+  welcomeSubtitle: {
+    fontSize: 14,
+    color: "#6b7280",
+    lineHeight: 1.6,
+  },
+  welcomeGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+    gap: 16,
+    width: "100%",
+    maxWidth: 900,
+  },
+  welcomeCard: {
+    background: "#fff",
+    border: "1px solid #e5e7eb",
+    borderRadius: 12,
+    padding: "18px 20px",
+    cursor: "pointer",
+    transition: "all 0.2s",
+    boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+  },
+  welcomeCardHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  welcomeControlBadge: {
+    padding: "3px 10px",
+    borderRadius: 5,
+    fontSize: 11,
+    fontWeight: 700,
     color: "#fff",
-    border: "none",
+    letterSpacing: 0.3,
+  },
+  welcomeRunBadge: {
+    fontSize: 10,
+    fontWeight: 600,
+    padding: "2px 8px",
     borderRadius: 8,
+  },
+  welcomeCardName: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "#111827",
+    lineHeight: 1.3,
+    marginBottom: 4,
+  },
+  welcomeCardDomain: {
+    fontSize: 12,
+    color: "#6b7280",
+    marginBottom: 12,
+  },
+  welcomeCardAction: {
     fontSize: 12,
     fontWeight: 600,
-    cursor: "pointer",
-  },
-  quickActionBtnSecondary: {
-    padding: "6px 12px",
-    background: "#fff",
-    border: "1px solid",
-    borderRadius: 8,
-    fontSize: 11,
-    fontWeight: 600,
-    cursor: "pointer",
+    color: "#f36f21",
   },
 };

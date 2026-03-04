@@ -4,6 +4,7 @@ LangGraph state machine for the GSK Controls Evidence Review Agent.
 Implements the FRMC control testing workflow with:
 - Retry + exponential backoff for 429 rate limit errors
 - Cancellation support via thread-local flag
+- Hybrid tool loading: UC functions for pure-logic tools, @tool for file I/O
 """
 
 from __future__ import annotations
@@ -18,9 +19,60 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt.tool_node import ToolNode
 
-from agent.config import LLM_ENDPOINT
+from agent.config import LLM_ENDPOINT, UC_CATALOG, UC_SCHEMA
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools import ALL_TOOLS
+
+# -- Hybrid tool loading -------------------------------------------------------
+# Pure-logic tools from Unity Catalog (no file I/O or authenticated API calls)
+from databricks_langchain import UCFunctionToolkit
+
+_UC_FUNCTION_NAMES = [
+    f"{UC_CATALOG}.{UC_SCHEMA}.generate_test_plan",
+    f"{UC_CATALOG}.{UC_SCHEMA}.ask_user",
+]
+
+_toolkit = UCFunctionToolkit(function_names=_UC_FUNCTION_NAMES)
+_uc_tools = _toolkit.tools
+
+# File I/O and LLM-powered tools from local @tool implementations
+# (UC sandbox doesn't have filesystem access or Databricks auth)
+from agent.tools import (
+    list_projects,
+    load_engagement,
+    parse_workbook,
+    extract_workbook_images,
+    review_document,
+    review_screenshot,
+    analyze_email,
+    execute_test,
+    aggregate_test_results,
+    compile_results,
+    fill_workbook,
+    save_report,
+    send_email,
+    announce_plan,
+    batch_review_evidence,
+    batch_execute_tests,
+)
+
+ALL_TOOLS = _uc_tools + [
+    list_projects,
+    load_engagement,
+    parse_workbook,
+    extract_workbook_images,
+    review_document,
+    review_screenshot,
+    analyze_email,
+    execute_test,
+    aggregate_test_results,
+    compile_results,
+    fill_workbook,
+    save_report,
+    send_email,
+    announce_plan,
+    batch_review_evidence,
+    batch_execute_tests,
+]
 
 _cancel_flags = threading.local()
 

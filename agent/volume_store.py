@@ -67,7 +67,7 @@ def artifact_path(project_dir: str, run_id: str, filename: str) -> str:
 # ── write operations ────────────────────────────────────────────────────
 def upload_text(vol_path: str, content: str) -> str:
     """Upload UTF-8 text to a volume path.  Returns the path on success."""
-    _ws().files.upload(vol_path, content.encode("utf-8"), overwrite=True)
+    _ws().files.upload(vol_path, io.BytesIO(content.encode("utf-8")), overwrite=True)
     log.info("Uploaded text → %s (%d bytes)", vol_path, len(content))
     return vol_path
 

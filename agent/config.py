@@ -8,16 +8,22 @@ import base64
 import os
 
 # -- LLM endpoints (Databricks Foundation Model APIs) --
-# Sonnet 4.6 for reasoning-heavy tasks (orchestration, test execution, report generation, vision)
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "databricks-claude-sonnet-4-6")
+# Opus 4.6 for reasoning-heavy tasks (orchestration, test execution, report generation)
+LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "databricks-claude-opus-4-6")
 VISION_LLM_ENDPOINT = os.getenv("VISION_LLM_ENDPOINT", "databricks-claude-sonnet-4-6")
 # Haiku 4.5 for fast extraction tasks (document review, email parsing)
 FAST_LLM_ENDPOINT = os.getenv("FAST_LLM_ENDPOINT", "databricks-claude-haiku-4-5")
 
 # -- Unity Catalog --
-UC_CATALOG = os.getenv("UC_CATALOG", "catalog_sandbox_e1b2kq")
+UC_CATALOG = os.getenv("UC_CATALOG", "")
 UC_SCHEMA = os.getenv("UC_SCHEMA", "gsk_compliance")
 UC_VOLUME = os.getenv("UC_VOLUME", "evidence_files")
+
+if not UC_CATALOG:
+    raise EnvironmentError(
+        "UC_CATALOG is required. Set it in app.yaml or via the UC_CATALOG env var. "
+        "Run `python setup.py --catalog YOUR_CATALOG` to configure."
+    )
 VOLUME_PATH = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}"
 
 # -- Projects --
@@ -31,7 +37,7 @@ PROJECTS_LOCAL_PATH = os.getenv(
 )
 
 # -- Email (Gmail SMTP with App Password) --
-SMTP_EMAIL = os.getenv("SMTP_EMAIL", "seanxzhang94@gmail.com")
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_DISPLAY_NAME = os.getenv("SMTP_DISPLAY_NAME", "GSK Compliance Agent")
 
 _smtp_password_cache: str | None = None
