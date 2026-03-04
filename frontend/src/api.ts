@@ -11,6 +11,11 @@ export interface SubProgress {
   detail?: string;
 }
 
+export interface ImagePreview {
+  data_uri: string;
+  label: string;
+}
+
 export interface ToolStep {
   tool: string;
   label: string;
@@ -22,6 +27,7 @@ export interface ToolStep {
   artifact_volume_path?: string;
   workbook_artifact?: string;
   sub_progress?: SubProgress;
+  image_previews?: ImagePreview[];
 }
 
 export interface ThinkingEntry {

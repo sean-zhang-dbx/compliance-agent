@@ -442,13 +442,16 @@ def extract_workbook_images(file_path: str, context: str = "") -> str:
             response = llm.invoke([message])
             span.set_outputs({"response_length": len(response.content)})
 
-            analyses.append({
+            entry = {
                 "sheet": img_info["sheet"],
                 "anchor": img_info["anchor"],
                 "image_format": mime,
                 "size_bytes": len(img_info["data"]),
                 "analysis": response.content,
-            })
+            }
+            if len(img_info["data"]) < 500_000:
+                entry["preview_data_uri"] = f"data:{mime};base64,{b64}"
+            analyses.append(entry)
 
     return json.dumps({
         "file_path": file_path,
@@ -571,13 +574,16 @@ def review_screenshot(file_path: str, context: str = "", focus_area: Optional[st
         response = llm.invoke([message])
         span.set_outputs({"response_length": len(response.content)})
 
-    return json.dumps({
+    result = {
         "file_path": file_path,
         "image_type": ext,
         "file_size_bytes": len(content),
         "review_focus": focus,
         "analysis": response.content,
-    }, indent=2)
+    }
+    if len(content) < 500_000:
+        result["preview_data_uri"] = f"data:{mime};base64,{b64}"
+    return json.dumps(result, indent=2)
 
 
 @tool

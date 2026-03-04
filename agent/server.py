@@ -348,6 +348,29 @@ def _summarize_result(name: str, result_str: str) -> str:
     return result_str[:500] if len(result_str) > 500 else result_str
 
 
+def _extract_image_previews(result_str: str) -> list[dict]:
+    """Pull preview_data_uri values from tool result JSON."""
+    import json as _json
+    previews: list[dict] = []
+    try:
+        d = _json.loads(result_str)
+        if isinstance(d, dict):
+            if d.get("preview_data_uri"):
+                previews.append({
+                    "data_uri": d["preview_data_uri"],
+                    "label": Path(d.get("file_path", "image")).name,
+                })
+            for entry in d.get("analyses", []):
+                if isinstance(entry, dict) and entry.get("preview_data_uri"):
+                    previews.append({
+                        "data_uri": entry["preview_data_uri"],
+                        "label": f"{entry.get('sheet', 'image')} ({entry.get('anchor', '')})",
+                    })
+    except Exception:
+        pass
+    return previews
+
+
 _THINKING_TEMPLATES: dict[str, str] = {
     "list_projects": "Let me discover what projects are available for review.",
     "load_engagement": "Loading the engagement data for {arg} to understand control requirements, testing attributes, and evidence files.",
@@ -892,6 +915,17 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                                     matched_step["duration"] = round(
                                         _time.time() - matched_step.get("started_at", _time.time()), 1
                                     )
+                                    image_previews = _extract_image_previews(result_str)
+                                    matched_step["image_previews"] = image_previews
+
+                                    if image_previews:
+                                        img_lines = [f"**Extracted {len(image_previews)} image(s):**\n"]
+                                        for ip in image_previews:
+                                            img_lines.append(f"![{ip['label']}]({ip['data_uri']})")
+                                        _tasks[task_id]["thinking"].append({
+                                            "content": "\n".join(img_lines),
+                                            "timestamp": _time.time(),
+                                        })
 
                                     tool_info = pending_args.get(call_id, {})
                                     tool_name = tool_info.get("name", matched_step["tool"])

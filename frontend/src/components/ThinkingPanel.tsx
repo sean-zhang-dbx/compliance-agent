@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { ThinkingEntry, AgentPlan, PlanStep, ToolStep } from "../api";
 
 export interface TimelineEntry {
@@ -239,7 +240,7 @@ function ConversationLog({
                 {ts}
               </div>
               <div className="thinking-md" style={{ fontSize: 12.5, color: "rgba(255,255,255,0.85)", lineHeight: 1.5 }}>
-                <ReactMarkdown>{entry.content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{entry.content}</ReactMarkdown>
               </div>
             </div>
           );
@@ -412,19 +413,30 @@ export default function ThinkingPanel({
         .thinking-md pre code { background: transparent; padding: 0; }
         .thinking-md table {
           border-collapse: collapse; width: 100%; margin: 6px 0;
-          font-size: 11px;
+          font-size: 11px; display: block; overflow-x: auto;
         }
         .thinking-md th, .thinking-md td {
-          border: 1px solid rgba(255,255,255,0.15); padding: 4px 8px;
-          text-align: left;
+          border: 1px solid rgba(255,255,255,0.15); padding: 5px 10px;
+          text-align: left; white-space: nowrap;
         }
         .thinking-md th {
-          background: rgba(255,255,255,0.08); font-weight: 600;
-          color: rgba(255,255,255,0.9);
+          background: rgba(99,102,241,0.15); font-weight: 600;
+          color: rgba(255,255,255,0.95); position: sticky; top: 0;
+        }
+        .thinking-md tr:nth-child(even) {
+          background: rgba(255,255,255,0.03);
+        }
+        .thinking-md tr:hover {
+          background: rgba(255,255,255,0.06);
         }
         .thinking-md hr {
           border: none; border-top: 1px solid rgba(255,255,255,0.1);
           margin: 8px 0;
+        }
+        .thinking-md img {
+          max-width: 100%; max-height: 240px; border-radius: 6px;
+          border: 1px solid rgba(255,255,255,0.15); margin: 4px 0;
+          display: block;
         }
         .thinking-md a { color: #818cf8; text-decoration: underline; }
         .thinking-md blockquote {

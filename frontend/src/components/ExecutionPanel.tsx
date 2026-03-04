@@ -840,6 +840,18 @@ export default function ExecutionPanel({
                                 {step.result_summary.length > 120 ? step.result_summary.slice(0, 120) + "…" : step.result_summary}
                               </div>
                             )}
+                            {isDone && step.image_previews && step.image_previews.length > 0 && !isExpanded && (
+                              <div style={{ display: "flex", gap: 4, marginTop: 4, flexWrap: "wrap" }}>
+                                {step.image_previews.slice(0, 3).map((img, pi) => (
+                                  <img key={pi} src={img.data_uri} alt={img.label} style={{ width: 48, height: 48, objectFit: "cover", borderRadius: 4, border: "1px solid #e5e7eb" }} />
+                                ))}
+                                {step.image_previews.length > 3 && (
+                                  <div style={{ width: 48, height: 48, borderRadius: 4, border: "1px solid #e5e7eb", background: "#f3f4f6", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#6b7280", fontWeight: 600 }}>
+                                    +{step.image_previews.length - 3}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                             {isActive && !step.sub_progress && (
                               <div style={{ height: 2, background: "#fed7aa", borderRadius: 1, marginTop: 4, overflow: "hidden", width: "80%" }}>
                                 <div style={{ height: "100%", width: "40%", background: "#f36f21", borderRadius: 1, animation: "indeterminate 1.5s infinite ease-in-out" }} />
@@ -885,6 +897,18 @@ export default function ExecutionPanel({
                               </div>
                             );
                           })()}
+                          {step.image_previews && step.image_previews.length > 0 && (
+                            <div style={{ display: "flex", flexDirection: "column" as const, gap: 8, marginBottom: 8 }}>
+                              {step.image_previews.map((img, pi) => (
+                                <div key={pi} style={{ border: "1px solid #e5e7eb", borderRadius: 6, overflow: "hidden", background: "#fafafa" }}>
+                                  <img src={img.data_uri} alt={img.label} style={{ maxWidth: "100%", maxHeight: 300, display: "block" }} />
+                                  <div style={{ padding: "4px 8px", fontSize: 10, color: "#6b7280", background: "#f9fafb", borderTop: "1px solid #e5e7eb" }}>
+                                    {img.label}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {artifactLoading ? <div style={S.loadingText}>Loading artifact...</div> : (
                             <pre style={{ fontSize: 11, color: "#374151", lineHeight: 1.6, whiteSpace: "pre-wrap" as const, wordBreak: "break-word" as const, fontFamily: "'SF Mono', 'Fira Code', monospace", margin: 0 }}>
                               {artifactContent || step.result_summary || "No output"}
