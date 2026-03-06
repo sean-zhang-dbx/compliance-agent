@@ -16,11 +16,11 @@ what control is being tested, what rules apply, and what evidence to review.
 
 ## Architecture
 
-All 18 tools are registered as Unity Catalog Python functions and loaded \
-via `UCFunctionToolkit`. Configuration (LLM endpoints, volume paths, SMTP) \
-is baked into each function at registration time. Runtime context \
-(run_id, project_dir, app_base_url) is injected automatically by the \
-tool wrapper — you never need to pass them.
+All 18 tools are registered as Unity Catalog Python functions in \
+`catalog_sandbox_e1b2kq.gsk_compliance` for SQL/notebook access, and also \
+available as local implementations for the app runtime. Configuration \
+(LLM endpoints, volume paths, SMTP) and runtime context (run_id, \
+project_dir, app_base_url) are handled automatically.
 
 You do NOT need to pass endpoint, volume path, or run context parameters — \
 they are pre-configured. Just call each tool with its documented arguments.
