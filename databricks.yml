@@ -7,6 +7,7 @@ sync:
     - deploy_app/app.yaml
     - deploy_app/static/**
     - deploy_app/frontend/dist/**
+    - sample_data/**
 
 include:
   - resources/*.yml
@@ -14,6 +15,7 @@ include:
 variables:
   catalog:
     description: Unity Catalog catalog for all project data and artifacts
+    default: compliance_agent
   schema:
     description: Schema within the catalog for compliance agent tables and volumes
     default: gsk_compliance
@@ -40,14 +42,7 @@ targets:
     mode: development
     workspace:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
-
-  uc:
-    mode: development
-    variables:
-      catalog: catalog_sandbox_e1b2kq
-    workspace:
-      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/uc
-
+      profile: https://dbc-f54701da-bc5e.cloud.databricks.com/
   prod:
     mode: production
     workspace:

@@ -166,6 +166,14 @@ def write_databricks_yml(args: argparse.Namespace):
     bundle:
       name: gsk-compliance-agent
 
+    sync:
+      include:
+        - deploy_app/agent/**
+        - deploy_app/app.yaml
+        - deploy_app/static/**
+        - deploy_app/frontend/dist/**
+        - sample_data/**
+
     include:
       - resources/*.yml
 
@@ -211,11 +219,10 @@ def write_databricks_yml(args: argparse.Namespace):
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Deploy via DAB
+# Step 5: Register UC functions
 # ---------------------------------------------------------------------------
 
 def register_uc_functions(args: argparse.Namespace):
-    section("Registering UC functions")
     cmd = [
         sys.executable, str(ROOT / "scripts" / "register_uc_functions.py"),
         "--catalog", args.catalog,
@@ -250,7 +257,85 @@ def deploy_bundle(args: argparse.Namespace):
 
 
 # ---------------------------------------------------------------------------
-# Step 6: Run sample data setup job
+# Step 6b: Grant the app's service principal access to UC resources
+# ---------------------------------------------------------------------------
+
+def grant_app_permissions(args: argparse.Namespace):
+    """Look up the deployed app's service principal and grant it UC access.
+
+    The DAB creates the app with an auto-generated service principal. That SP
+    needs USE_CATALOG, USE_SCHEMA, READ_VOLUME, and WRITE_VOLUME to read
+    evidence files and write reports/artifacts back to the volume.
+    """
+    section("Granting UC permissions to app service principal")
+
+    app_name = f"gsk-compliance-agent-{args.target}"
+    print(f"  App: {app_name}")
+
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.sql import StatementState
+
+        w = WorkspaceClient()
+        app = w.apps.get(app_name)
+        sp_id = app.service_principal_client_id
+        if not sp_id:
+            print("  WARNING: Could not determine app service principal. Skipping grants.")
+            return
+
+        print(f"  Service principal: {sp_id}")
+
+        warehouse_id = None
+        for wh in w.warehouses.list():
+            if wh.state and wh.state.value == "RUNNING":
+                warehouse_id = wh.id
+                break
+        if not warehouse_id:
+            for wh in w.warehouses.list():
+                if wh.id:
+                    warehouse_id = wh.id
+                    break
+        if not warehouse_id:
+            print("  WARNING: No SQL warehouse found. Skipping grants.")
+            print(f"  Run manually:\n"
+                  f"    GRANT USE_CATALOG ON CATALOG {args.catalog} TO `{sp_id}`;\n"
+                  f"    GRANT USE_SCHEMA ON SCHEMA {args.catalog}.{args.schema} TO `{sp_id}`;\n"
+                  f"    GRANT READ_VOLUME, WRITE_VOLUME ON VOLUME {args.catalog}.{args.schema}.{args.volume} TO `{sp_id}`;")
+            return
+
+        grants = [
+            f"GRANT USE_CATALOG ON CATALOG {args.catalog} TO `{sp_id}`",
+            f"GRANT USE_SCHEMA ON SCHEMA {args.catalog}.{args.schema} TO `{sp_id}`",
+            f"GRANT READ_VOLUME, WRITE_VOLUME ON VOLUME {args.catalog}.{args.schema}.{args.volume} TO `{sp_id}`",
+        ]
+
+        for stmt in grants:
+            short_desc = stmt.split(" TO ")[0]
+            print(f"  {short_desc} ...", end=" ", flush=True)
+            try:
+                resp = w.statement_execution.execute_statement(
+                    warehouse_id=warehouse_id,
+                    statement=stmt,
+                    wait_timeout="30s",
+                )
+                if resp.status and resp.status.state == StatementState.SUCCEEDED:
+                    print("OK")
+                elif resp.status and resp.status.state == StatementState.FAILED:
+                    print(f"FAILED: {resp.status.error}")
+                else:
+                    print("OK")
+            except Exception as e:
+                print(f"ERROR: {e}")
+
+        print("  App permissions granted.")
+
+    except Exception as e:
+        print(f"  WARNING: Could not grant app permissions: {e}")
+        print(f"  You may need to grant manually — see README for details.")
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Run sample data setup job
 # ---------------------------------------------------------------------------
 
 def run_data_setup(args: argparse.Namespace):
@@ -262,7 +347,7 @@ def run_data_setup(args: argparse.Namespace):
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Start the app
+# Step 8: Start the app
 # ---------------------------------------------------------------------------
 
 def start_app(args: argparse.Namespace):
@@ -375,6 +460,7 @@ def main():
         return
 
     deploy_bundle(args)
+    grant_app_permissions(args)
 
     if not args.skip_data:
         run_data_setup(args)

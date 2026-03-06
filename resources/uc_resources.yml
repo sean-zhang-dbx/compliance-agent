@@ -24,3 +24,4 @@ resources:
         - principal: account users
           privileges:
             - READ_VOLUME
+            - WRITE_VOLUME
