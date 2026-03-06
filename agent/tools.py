@@ -15,7 +15,7 @@ Tools:
   - execute_test             -> Run a specific test attribute against a sample item
   - compile_results          -> Produce the final assessment report
   - save_report              -> Persist the report to the project directory
-  - send_email               -> Send email via Microsoft Graph API (or simulate)
+  - send_email               -> Send email via Gmail SMTP (or save as .eml)
   - ask_user                 -> Ask the user for clarification
 """
 

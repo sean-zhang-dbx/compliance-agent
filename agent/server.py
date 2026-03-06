@@ -97,6 +97,7 @@ _SHORT_NAMES = [
     "generate_test_plan", "execute_test", "aggregate_test_results",
     "compile_results", "fill_workbook", "save_report", "send_email", "ask_user",
 ]
+# All tools are now loaded from UC — tool names use catalog__schema__name format
 
 _LABEL_MAP = {
     "list_projects": "Discovering projects",

@@ -29,13 +29,17 @@ import os, json, sys
 from pathlib import Path
 from pprint import pprint
 
+dbutils.widgets.text("catalog", "", "UC Catalog")
+
 notebook_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 workspace_root = "/Workspace" + str(Path(notebook_path).parent.parent)
 
 sys.path.insert(0, workspace_root)
 
-os.environ["LLM_ENDPOINT"] = "databricks-claude-3-7-sonnet"
-os.environ["VISION_LLM_ENDPOINT"] = "databricks-claude-3-7-sonnet"
+os.environ["LLM_ENDPOINT"] = "databricks-claude-opus-4-6"
+os.environ["VISION_LLM_ENDPOINT"] = "databricks-claude-sonnet-4-6"
+os.environ["FAST_LLM_ENDPOINT"] = "databricks-claude-haiku-4-5"
+os.environ["UC_CATALOG"] = dbutils.widgets.get("catalog") if dbutils.widgets.get("catalog") else spark.conf.get("spark.databricks.unityCatalog.defaultCatalog", "main")
 os.environ["PROJECTS_LOCAL_PATH"] = f"{workspace_root}/sample_data/projects"
 
 import mlflow
@@ -310,8 +314,13 @@ if wb_data["testing_attributes"] and wb_data["selected_sample"]:
 
 # COMMAND ----------
 
-population_tab = wb_data["tabs"].get("Population", {})
-pop_size = population_tab.get("row_count", 0)
+pop_size = 0
+for tab_name, tab_info in wb_data.get("tabs", {}).items():
+    if "population" in tab_name.lower() or "journal" in tab_name.lower() or "cutoff" in tab_name.lower():
+        pop_size = tab_info.get("row_count", 0)
+        break
+if not pop_size:
+    pop_size = int(wb_data.get("sampling_config", {}).get("Population Size", 0))
 
 report = compile_results.invoke({
     "control_id": eng["control_objective"]["control_id"],
@@ -358,7 +367,7 @@ for f in save_result["files"]:
 # MAGIC ### Tool 8: `send_email` → Notify stakeholders
 # MAGIC
 # MAGIC **Input:** recipient, subject, body (HTML)  
-# MAGIC **Output:** Sent status (or simulated .eml if Graph API not configured)
+# MAGIC **Output:** Sent status (or simulated .eml if SMTP not configured)
 
 # COMMAND ----------
 
@@ -485,12 +494,12 @@ for proj_dir in sorted(projects_dir.iterdir()):
 # MAGIC | Component | Technology | Purpose |
 # MAGIC |-----------|-----------|---------|
 # MAGIC | **Agent Orchestration** | LangGraph | Stateful tool-calling loop |
-# MAGIC | **LLM Reasoning** | Databricks Foundation Model API (Claude 3.7 Sonnet) | Document analysis, test execution, report generation |
-# MAGIC | **Vision Analysis** | Claude 3.7 Sonnet (multimodal) | Screenshot, photo, and embedded image analysis |
+# MAGIC | **LLM Reasoning** | Databricks Foundation Model API (Claude Opus 4.6 / Haiku 4.5) | Document analysis, test execution, report generation |
+# MAGIC | **Vision Analysis** | Claude Sonnet 4.6 (multimodal) | Screenshot, photo, and embedded image analysis |
 # MAGIC | **Data Storage** | Unity Catalog Volumes | Project files, evidence, reports |
 # MAGIC | **Observability** | MLflow Tracing | Full trace of every tool call with inputs/outputs |
 # MAGIC | **Deployment** | Databricks Apps | FastAPI backend + React frontend |
-# MAGIC | **Notifications** | Microsoft Graph API / Gmail | Email report delivery |
+# MAGIC | **Notifications** | Gmail SMTP | Email report delivery |
 # MAGIC
 # MAGIC ### Inputs → Outputs Flow
 # MAGIC
