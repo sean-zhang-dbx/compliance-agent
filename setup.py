@@ -214,6 +214,25 @@ def write_databricks_yml(args: argparse.Namespace):
 # Step 5: Deploy via DAB
 # ---------------------------------------------------------------------------
 
+def register_uc_functions(args: argparse.Namespace):
+    section("Registering UC functions")
+    cmd = [
+        sys.executable, str(ROOT / "scripts" / "register_uc_functions.py"),
+        "--catalog", args.catalog,
+        "--schema", args.schema,
+        "--volume", args.volume,
+        "--llm-endpoint", args.llm_endpoint,
+        "--vision-llm-endpoint", args.vision_llm_endpoint,
+        "--fast-llm-endpoint", args.fast_llm_endpoint,
+    ]
+    if args.smtp_email:
+        cmd.extend(["--smtp-email", args.smtp_email])
+    result = run(cmd, cwd=ROOT, check=False)
+    if result.returncode != 0:
+        print("  WARNING: UC function registration failed. The app may not work correctly.")
+        print("  You can retry manually: python scripts/register_uc_functions.py --catalog", args.catalog)
+
+
 def deploy_bundle(args: argparse.Namespace):
     section(f"Deploying bundle (target: {args.target})")
 
@@ -343,6 +362,7 @@ def main():
 
     generate_app_yaml(args)
     write_databricks_yml(args)
+    register_uc_functions(args)
 
     if args.config_only:
         section("Config-only mode — files generated, skipping deploy")

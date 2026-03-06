@@ -14,6 +14,7 @@ node_modules/
 # Generated build artifacts (recreated by setup.py)
 frontend/dist/
 deploy_app/agent/
+deploy_app/app.yaml
 deploy_app/frontend/dist/
 deploy_app/static/
 

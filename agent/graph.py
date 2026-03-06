@@ -1,10 +1,10 @@
 """
 LangGraph state machine for the GSK Controls Evidence Review Agent.
 
-Implements the FRMC control testing workflow with:
-- Retry + exponential backoff for 429 rate limit errors
-- Cancellation support via thread-local flag
-- Hybrid tool loading: UC functions for pure-logic tools, @tool for file I/O
+All 18 tools are registered as Unity Catalog Python functions and loaded
+via UCFunctionToolkit.  Tools that need runtime context (run_id,
+project_dir, app_base_url) are wrapped to auto-inject values from
+contextvars so the LLM never has to pass them.
 """
 
 from __future__ import annotations
@@ -15,64 +15,95 @@ from typing import Annotated, Any, Sequence, TypedDict
 
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import StructuredTool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt.tool_node import ToolNode
+from pydantic import create_model
 
 from agent.config import LLM_ENDPOINT, UC_CATALOG, UC_SCHEMA
 from agent.prompts import SYSTEM_PROMPT
+from agent.run_context import get_run_id, get_project_dir, get_app_base_url
 
-# -- Hybrid tool loading -------------------------------------------------------
-# Pure-logic tools from Unity Catalog (no file I/O or authenticated API calls)
+# -- Load all tools from Unity Catalog ----------------------------------------
+
 from databricks_langchain import UCFunctionToolkit
 
-_UC_FUNCTION_NAMES = [
-    f"{UC_CATALOG}.{UC_SCHEMA}.generate_test_plan",
-    f"{UC_CATALOG}.{UC_SCHEMA}.ask_user",
+_TOOL_NAMES = [
+    "list_projects",
+    "load_engagement",
+    "announce_plan",
+    "parse_workbook",
+    "extract_workbook_images",
+    "review_document",
+    "review_screenshot",
+    "analyze_email",
+    "generate_test_plan",
+    "execute_test",
+    "aggregate_test_results",
+    "compile_results",
+    "fill_workbook",
+    "save_report",
+    "send_email",
+    "ask_user",
+    "batch_review_evidence",
+    "batch_execute_tests",
 ]
+
+_UC_FUNCTION_NAMES = [f"{UC_CATALOG}.{UC_SCHEMA}.{name}" for name in _TOOL_NAMES]
 
 _toolkit = UCFunctionToolkit(function_names=_UC_FUNCTION_NAMES)
-_uc_tools = _toolkit.tools
 
-# File I/O and LLM-powered tools from local @tool implementations
-# (UC sandbox doesn't have filesystem access or Databricks auth)
-from agent.tools import (
-    list_projects,
-    load_engagement,
-    parse_workbook,
-    extract_workbook_images,
-    review_document,
-    review_screenshot,
-    analyze_email,
-    execute_test,
-    aggregate_test_results,
-    compile_results,
-    fill_workbook,
-    save_report,
-    send_email,
-    announce_plan,
-    batch_review_evidence,
-    batch_execute_tests,
-)
+# -- Context injection wrapper -------------------------------------------------
+# UC functions that need runtime context declare run_id / project_dir /
+# app_base_url as parameters.  We strip these from the LLM-facing schema
+# and inject them from contextvars at call time.
 
-ALL_TOOLS = _uc_tools + [
-    list_projects,
-    load_engagement,
-    parse_workbook,
-    extract_workbook_images,
-    review_document,
-    review_screenshot,
-    analyze_email,
-    execute_test,
-    aggregate_test_results,
-    compile_results,
-    fill_workbook,
-    save_report,
-    send_email,
-    announce_plan,
-    batch_review_evidence,
-    batch_execute_tests,
-]
+_CONTEXT_PARAMS = {"run_id", "project_dir", "app_base_url"}
+
+
+def _wrap_tools(uc_tools: list) -> list:
+    """Wrap UC tools to auto-inject context parameters the LLM should not see."""
+    wrapped = []
+    for tool in uc_tools:
+        schema = tool.args_schema
+        ctx_keys = set(schema.model_fields.keys()) & _CONTEXT_PARAMS
+
+        if not ctx_keys:
+            wrapped.append(tool)
+            continue
+
+        # Build a new Pydantic model excluding context fields
+        business_fields: dict = {}
+        for field_name, field_info in schema.model_fields.items():
+            if field_name not in ctx_keys:
+                business_fields[field_name] = (field_info.annotation, field_info)
+
+        NewSchema = create_model(f"{tool.name}_business", **business_fields)
+
+        def _make_fn(_tool, _ctx_keys):
+            def fn(**kwargs):
+                if "run_id" in _ctx_keys:
+                    kwargs["run_id"] = get_run_id()
+                if "project_dir" in _ctx_keys:
+                    kwargs["project_dir"] = get_project_dir()
+                if "app_base_url" in _ctx_keys:
+                    kwargs["app_base_url"] = get_app_base_url()
+                return _tool.invoke(kwargs)
+            return fn
+
+        wrapped.append(StructuredTool(
+            name=tool.name,
+            description=tool.description,
+            func=_make_fn(tool, ctx_keys),
+            args_schema=NewSchema,
+        ))
+    return wrapped
+
+
+ALL_TOOLS = _wrap_tools(_toolkit.tools)
+
+# -- Cancellation support ------------------------------------------------------
 
 _cancel_flags = threading.local()
 

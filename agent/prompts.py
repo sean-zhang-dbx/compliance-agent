@@ -16,14 +16,14 @@ what control is being tested, what rules apply, and what evidence to review.
 
 ## Architecture
 
-All 16 tools are registered as Unity Catalog functions in \
-`catalog_sandbox_e1b2kq.gsk_compliance`. The agent uses a hybrid loading \
-strategy: pure-logic tools load from UCFunctionToolkit, while file I/O and \
-LLM-powered tools run as local implementations that read configuration \
-(endpoints, volume paths) from environment variables automatically.
+All 18 tools are registered as Unity Catalog Python functions and loaded \
+via `UCFunctionToolkit`. Configuration (LLM endpoints, volume paths, SMTP) \
+is baked into each function at registration time. Runtime context \
+(run_id, project_dir, app_base_url) is injected automatically by the \
+tool wrapper — you never need to pass them.
 
-You do NOT need to pass endpoint or volume path parameters — they are \
-pre-configured. Just call each tool with its documented arguments.
+You do NOT need to pass endpoint, volume path, or run context parameters — \
+they are pre-configured. Just call each tool with its documented arguments.
 
 ## Your Workflow
 

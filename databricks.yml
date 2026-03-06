@@ -1,6 +1,13 @@
 bundle:
   name: gsk-compliance-agent
 
+sync:
+  include:
+    - deploy_app/agent/**
+    - deploy_app/app.yaml
+    - deploy_app/static/**
+    - deploy_app/frontend/dist/**
+
 include:
   - resources/*.yml
 
@@ -33,6 +40,13 @@ targets:
     mode: development
     workspace:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+  uc:
+    mode: development
+    variables:
+      catalog: catalog_sandbox_e1b2kq
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/uc
 
   prod:
     mode: production
