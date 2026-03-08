@@ -38,6 +38,36 @@ from agent.config import VOLUME_PATH, PROJECTS_BASE_PATH, PROJECTS_LOCAL_PATH
 
 SAMPLE_DATA_DIR = Path(__file__).parent.parent / "sample_data"
 
+# ---------------------------------------------------------------------------
+# Run cache — shared in-memory store so tools don't need to pass large JSON
+# through the LLM. Producer tools save here; consumer tools read from here.
+# Keyed by run_id (set via run_context).
+# ---------------------------------------------------------------------------
+_run_cache: dict[str, dict] = {}
+
+
+def _cache_set(key: str, value):
+    """Store a value in the run cache for the current run."""
+    from agent.run_context import get_run_id
+    rid = get_run_id() or "__default__"
+    if rid not in _run_cache:
+        _run_cache[rid] = {}
+    _run_cache[rid][key] = value
+
+
+def _cache_get(key: str, default=None):
+    """Retrieve a value from the run cache for the current run."""
+    from agent.run_context import get_run_id
+    rid = get_run_id() or "__default__"
+    return _run_cache.get(rid, {}).get(key, default)
+
+
+def _cache_clear_run():
+    """Clear the cache for the current run (call at end of run)."""
+    from agent.run_context import get_run_id
+    rid = get_run_id() or "__default__"
+    _run_cache.pop(rid, None)
+
 
 @mlflow.trace(span_type="RETRIEVER", name="read_file")
 def _read_file_bytes(file_path: str) -> bytes:
@@ -211,6 +241,7 @@ def load_engagement(project_path: str) -> str:
 
     content = _read_file_bytes(file_path)
     engagement = json.loads(content)
+    _cache_set("engagement", engagement)
     mlflow.update_current_trace(tags={
         "engagement_number": engagement.get("number", ""),
         "control_id": engagement.get("control_objective", {}).get("control_id", ""),
@@ -334,6 +365,7 @@ def parse_workbook(file_path: str) -> str:
                             "answer": row[3].strip() if len(row) > 3 else "",
                         })
 
+    _cache_set("workbook", result)
     return json.dumps(result, indent=2)
 
 
@@ -666,26 +698,35 @@ def analyze_email(file_path: str, context: str = "", focus_area: Optional[str] =
 
 @tool
 def generate_test_plan(
-    engagement_json: str,
-    workbook_json: str,
+    engagement_json: str = "",
+    workbook_json: str = "",
 ) -> str:
     """Generate a deterministic test plan from the engagement and workbook data.
 
-    Call this AFTER load_engagement and parse_workbook. It computes the exact
-    list of (attribute, sample_item) pairs that must be tested. Then execute
-    each entry in the plan using execute_test.
+    Call this AFTER load_engagement and parse_workbook. Data is read
+    automatically from the run cache — you do NOT need to pass the full
+    engagement or workbook JSON. Just call generate_test_plan() with no args.
 
     Args:
-        engagement_json: The full engagement JSON returned by load_engagement.
-        workbook_json: The full workbook JSON returned by parse_workbook.
+        engagement_json: (optional) Override engagement data. Leave empty to
+            use cached data from load_engagement.
+        workbook_json: (optional) Override workbook data. Leave empty to
+            use cached data from parse_workbook.
 
     Returns:
         JSON with the ordered test_plan (list of tests to execute) and
         total_tests count. Each entry has test_ref, attribute, procedure,
         applies_to, and sample_item_json.
     """
-    engagement = json.loads(engagement_json) if isinstance(engagement_json, str) else engagement_json
-    workbook = json.loads(workbook_json) if isinstance(workbook_json, str) else workbook_json
+    if engagement_json and engagement_json.strip().startswith("{"):
+        engagement = json.loads(engagement_json) if isinstance(engagement_json, str) else engagement_json
+    else:
+        engagement = _cache_get("engagement", {})
+
+    if workbook_json and workbook_json.strip().startswith("{"):
+        workbook = json.loads(workbook_json) if isinstance(workbook_json, str) else workbook_json
+    else:
+        workbook = _cache_get("workbook", {})
 
     attributes = engagement.get("testing_attributes", [])
     rules = engagement.get("control_objective", {}).get("rules", {})
@@ -772,13 +813,16 @@ def generate_test_plan(
                     "sample_item_json": json.dumps({"_type": "no_applicable_items", "filter": applies_to}),
                 })
 
-    return json.dumps({
+    test_plan_result = {
         "test_plan": test_plan,
         "total_tests": len(test_plan),
         "attributes_count": len(attributes),
         "sample_size": len(selected_sample),
-        "instruction": "Execute EVERY entry in test_plan using execute_test. Do NOT skip any.",
-    }, indent=2)
+    }
+    _cache_set("test_plan", test_plan)
+    # Also cache control_context for batch_execute_tests
+    _cache_set("control_context", json.dumps(engagement.get("control_objective", {})))
+    return json.dumps(test_plan_result, indent=2)
 
 
 # =========================================================================
@@ -913,30 +957,235 @@ def execute_test(
     }, indent=2)
 
 
-@tool
-def compile_results(
+def _build_report_template(
     control_id: str,
     control_name: str,
     engagement_number: str,
     domain: str,
     population_size: int,
     sample_size: int,
-    testing_attributes_json: str,
-    test_results_json: str,
+    testing_attributes: list,
+    aggregated_results: list,
+    rules: dict,
+    llm_judgments: dict,
+) -> str:
+    """Build the final report from a fixed template + data + LLM judgments."""
+    from datetime import datetime as _dt
+
+    today = _dt.now().strftime("%Y-%m-%d")
+
+    pass_count = sum(1 for r in aggregated_results if r.get("result", "").lower() == "pass")
+    fail_count = sum(1 for r in aggregated_results if r.get("result", "").lower() == "fail")
+    total = len(aggregated_results)
+
+    exec_summary = llm_judgments.get("executive_summary", "Assessment completed.")
+    overall = llm_judgments.get("overall_assessment", "Effective" if fail_count == 0 else "Ineffective")
+    justification = llm_judgments.get("overall_justification", "")
+    low_conf_advisory = llm_judgments.get("low_confidence_advisory", "")
+
+    lines = [
+        f"# Controls Evidence Review Report",
+        f"",
+        f"| Field | Value |",
+        f"|-------|-------|",
+        f"| **Control** | {control_id} — {control_name} |",
+        f"| **Engagement** | {engagement_number} |",
+        f"| **Domain** | {domain} |",
+        f"| **Date** | {today} |",
+        f"| **Population** | {population_size:,} items |",
+        f"| **Sample Tested** | {sample_size} items |",
+        f"| **Overall Assessment** | **{overall}** |",
+        f"",
+        f"---",
+        f"",
+        f"## 1. Executive Summary",
+        f"",
+        f"{exec_summary}",
+        f"",
+        f"## 2. Testing Scope and Methodology",
+        f"",
+        f"The control **{control_id} — {control_name}** was assessed under "
+        f"engagement **{engagement_number}** (domain: {domain}). "
+        f"A sample of **{sample_size}** items was selected from a population "
+        f"of **{population_size:,}** for testing across "
+        f"**{len(testing_attributes)}** attributes.",
+        f"",
+    ]
+
+    if rules:
+        lines.append("**Control-Specific Rules:**")
+        lines.append("")
+        for k, v in rules.items():
+            lines.append(f"- **{k.replace('_', ' ').title()}**: {v}")
+        lines.append("")
+
+    if testing_attributes:
+        lines.append("**Testing Attributes:**")
+        lines.append("")
+        for attr in testing_attributes:
+            ref = attr.get("ref", "?")
+            name = attr.get("name", attr.get("attribute", ""))
+            lines.append(f"- **{ref}**: {name}")
+        lines.append("")
+
+    lines.extend([
+        f"## 3. Results Summary",
+        f"",
+        f"| Ref | Attribute | Result | Confidence | Exceptions |",
+        f"|-----|-----------|--------|------------|------------|",
+    ])
+
+    exceptions_list = []
+    issue_counter = 1
+
+    for r in aggregated_results:
+        ref = r.get("ref", "?")
+        attr_name = r.get("attribute_name", r.get("attribute", ref))
+        result = r.get("result", "Pending")
+        confidence = r.get("lowest_confidence", r.get("confidence", "—"))
+        excs = r.get("exceptions", [])
+        exc_count = len(excs)
+        exc_str = f"{exc_count} exception{'s' if exc_count != 1 else ''}" if exc_count else "None"
+        result_icon = "✓" if result.lower() == "pass" else "✗" if result.lower() == "fail" else "—"
+        lines.append(f"| {ref} | {attr_name[:50]} | {result} {result_icon} | {confidence} | {exc_str} |")
+
+        for exc in excs:
+            issue_id = f"ISS-{control_id}-{issue_counter:03d}"
+            exceptions_list.append({
+                "issue_id": issue_id,
+                "ref": ref,
+                "attr_name": attr_name,
+                "severity": exc.get("severity", "Medium"),
+                "description": exc.get("description", "See test narrative"),
+                "samples": exc.get("affected_samples", r.get("sample_items_tested", [])),
+                "root_cause": exc.get("root_cause", "See test narrative"),
+                "remediation": exc.get("remediation", "Review and remediate"),
+            })
+            issue_counter += 1
+
+    lines.extend([
+        f"",
+        f"**Summary**: {pass_count}/{total} attributes passed, "
+        f"{fail_count}/{total} failed, "
+        f"{len(exceptions_list)} exception{'s' if len(exceptions_list) != 1 else ''} identified.",
+        f"",
+    ])
+
+    lines.extend([
+        f"## 4. Control-Level Narratives",
+        f"",
+    ])
+    for r in aggregated_results:
+        ref = r.get("ref", "?")
+        attr_name = r.get("attribute_name", r.get("attribute", ref))
+        result = r.get("result", "Pending")
+        narrative = r.get("narrative", "No narrative available.")
+        if len(narrative) > 500:
+            narrative = narrative[:500] + "…"
+        result_icon = "✓ Pass" if result.lower() == "pass" else "✗ Fail" if result.lower() == "fail" else result
+        lines.extend([
+            f"### {ref} — {attr_name}",
+            f"",
+            f"**Result**: {result_icon}",
+            f"",
+            f"{narrative}",
+            f"",
+        ])
+
+    if exceptions_list:
+        lines.extend([
+            f"## 5. Exception Details",
+            f"",
+        ])
+        for exc in exceptions_list:
+            samples = exc["samples"]
+            if isinstance(samples, list):
+                samples = ", ".join(str(s) for s in samples[:10])
+            lines.extend([
+                f"### {exc['issue_id']} — Attribute {exc['ref']}",
+                f"",
+                f"- **Severity**: {exc['severity']}",
+                f"- **Description**: {exc['description']}",
+                f"- **Affected Samples**: {samples}",
+                f"- **Root Cause**: {exc['root_cause']}",
+                f"- **Remediation**: {exc['remediation']}",
+                f"",
+            ])
+    else:
+        lines.extend([
+            f"## 5. Exception Details",
+            f"",
+            f"No exceptions were identified during testing.",
+            f"",
+        ])
+
+    lines.extend([
+        f"## 6. Overall Control Assessment",
+        f"",
+        f"**Assessment: {overall}**",
+        f"",
+        f"{justification}",
+        f"",
+    ])
+
+    if low_conf_advisory:
+        lines.extend([
+            f"> **Auditor Advisory**: {low_conf_advisory}",
+            f"",
+        ])
+
+    if exceptions_list:
+        lines.extend([
+            f"## 7. Issue Register",
+            f"",
+            f"| Issue ID | Attribute | Severity | Description | Affected Samples | Status |",
+            f"|----------|-----------|----------|-------------|-----------------|--------|",
+        ])
+        for exc in exceptions_list:
+            samples = exc["samples"]
+            if isinstance(samples, list):
+                samples = ", ".join(str(s) for s in samples[:5])
+            desc = exc["description"][:80]
+            lines.append(
+                f"| {exc['issue_id']} | {exc['ref']} | {exc['severity']} | {desc} | {samples} | Open |"
+            )
+        lines.append("")
+
+    lines.extend([
+        f"---",
+        f"*Report generated on {today} by GSK Controls Evidence Review Agent.*",
+    ])
+
+    return "\n".join(lines)
+
+
+@tool
+def compile_results(
+    control_id: str = "",
+    control_name: str = "",
+    engagement_number: str = "",
+    domain: str = "",
+    population_size: int = 0,
+    sample_size: int = 0,
+    testing_attributes_json: str = "",
+    test_results_json: str = "",
     rules_json: str = "{}",
 ) -> str:
     """Compile all test results into the final assessment report.
 
+    All data is read automatically from the run cache. Just call
+    compile_results() with no arguments after batch_execute_tests.
+
     Args:
-        control_id: The control identifier.
-        control_name: The control name.
-        engagement_number: The engagement reference number.
-        domain: The control domain.
-        population_size: Total items in the population.
-        sample_size: Number of sampled items tested.
-        testing_attributes_json: JSON of testing attributes.
-        test_results_json: JSON of ALL test results.
-        rules_json: JSON of control-specific rules.
+        control_id: (optional) Override control ID. Auto-read from cache.
+        control_name: (optional) Override control name.
+        engagement_number: (optional) Override engagement number.
+        domain: (optional) Override domain.
+        population_size: (optional) Override population size.
+        sample_size: (optional) Override sample size.
+        testing_attributes_json: (optional) Override testing attributes.
+        test_results_json: (optional) Override test results.
+        rules_json: (optional) Override rules.
 
     Returns:
         Formatted markdown report.
@@ -947,6 +1196,49 @@ def compile_results(
 
     import time as _time
 
+    engagement = _cache_get("engagement", {})
+    workbook = _cache_get("workbook", {})
+    co = engagement.get("control_objective", {})
+
+    if not control_id:
+        control_id = co.get("control_id", "UNKNOWN")
+    if not control_name:
+        control_name = co.get("control_name", "Unknown Control")
+    if not engagement_number:
+        engagement_number = engagement.get("number", "")
+    if not domain:
+        domain = co.get("domain", "")
+    if not population_size:
+        sc = workbook.get("sampling_config", {})
+        pop_str = sc.get("Population Size", sc.get("Total Population", "0"))
+        try:
+            population_size = int(str(pop_str).replace(",", ""))
+        except (ValueError, TypeError):
+            population_size = 0
+    if not sample_size:
+        sample_size = len(workbook.get("selected_sample", []))
+
+    testing_attributes = engagement.get("testing_attributes", [])
+    if testing_attributes_json and len(testing_attributes_json) > 5:
+        try:
+            testing_attributes = json.loads(testing_attributes_json)
+        except Exception:
+            pass
+
+    aggregated = _cache_get("aggregated_results", [])
+    if test_results_json and len(test_results_json) > 5:
+        try:
+            aggregated = json.loads(test_results_json)
+        except Exception:
+            pass
+
+    rules = co.get("rules", {})
+    if rules_json and rules_json != "{}":
+        try:
+            rules = json.loads(rules_json)
+        except Exception:
+            pass
+
     with mlflow.start_span(name="generate_report", span_type="TOOL") as span:
         span.set_inputs({
             "control_id": control_id,
@@ -954,7 +1246,16 @@ def compile_results(
             "domain": domain,
             "population_size": population_size,
             "sample_size": sample_size,
+            "num_results": len(aggregated),
         })
+
+        results_summary = []
+        for r in aggregated:
+            results_summary.append(
+                f"- {r.get('ref', '?')}: {r.get('result', '?')} "
+                f"(confidence: {r.get('lowest_confidence', r.get('confidence', '?'))}, "
+                f"exceptions: {len(r.get('exceptions', []))})"
+            )
 
         prompt = REPORT_GENERATION_PROMPT.format(
             control_id=control_id,
@@ -963,19 +1264,33 @@ def compile_results(
             domain=domain,
             population_size=population_size,
             sample_size=sample_size,
-            testing_attributes=testing_attributes_json[:3000],
-            test_results=test_results_json[:8000],
-            rules=rules_json[:2000],
+            test_results="\n".join(results_summary) or "No results available",
+            rules=json.dumps(rules)[:1500],
         )
 
+        llm_judgments = {}
         llm = ChatDatabricks(endpoint=LLM_ENDPOINT, temperature=0)
 
         max_retries = 4
         backoff_base = 8
-        response = None
         for attempt in range(max_retries + 1):
             try:
                 response = llm.invoke(prompt)
+                raw = response.content.strip()
+                raw = raw.strip("`").lstrip("json").strip()
+                llm_judgments = json.loads(raw)
+                break
+            except json.JSONDecodeError:
+                fail_count = sum(1 for r in aggregated if r.get("result", "").lower() == "fail")
+                llm_judgments = {
+                    "executive_summary": f"Assessment of {control_id} completed. "
+                    f"{len(aggregated)} attributes tested, {fail_count} failures identified.",
+                    "overall_assessment": "Effective" if fail_count == 0
+                    else "Effective with Exceptions" if fail_count == 1
+                    else "Ineffective",
+                    "overall_justification": f"{fail_count} testing attribute(s) resulted in failures.",
+                    "low_confidence_advisory": "",
+                }
                 break
             except Exception as e:
                 err_str = str(e)
@@ -985,20 +1300,43 @@ def compile_results(
                     print(f"[compile_results] 429 on attempt {attempt+1}, retrying in {wait}s...")
                     _time.sleep(wait)
                     continue
-                raise
+                fail_count = sum(1 for r in aggregated if r.get("result", "").lower() == "fail")
+                llm_judgments = {
+                    "executive_summary": f"Assessment of {control_id} completed with {fail_count} exceptions.",
+                    "overall_assessment": "Effective" if fail_count == 0
+                    else "Effective with Exceptions" if fail_count == 1
+                    else "Ineffective",
+                    "overall_justification": "See detailed results below.",
+                    "low_confidence_advisory": "",
+                }
+                break
+
+        report = _build_report_template(
+            control_id=control_id,
+            control_name=control_name,
+            engagement_number=engagement_number,
+            domain=domain,
+            population_size=population_size,
+            sample_size=sample_size,
+            testing_attributes=testing_attributes,
+            aggregated_results=aggregated,
+            rules=rules,
+            llm_judgments=llm_judgments,
+        )
 
         span.set_outputs({
-            "report_length": len(response.content),
-            "has_exceptions": "ISS-" in response.content,
+            "report_length": len(report),
+            "has_exceptions": "ISS-" in report,
+            "overall_assessment": llm_judgments.get("overall_assessment", ""),
         })
 
-    return response.content
+    return report
 
 
 @tool
 def save_report(
-    project_path: str,
     report_content: str,
+    project_path: str = "",
     report_format: str = "markdown",
     control_id: str = "",
     control_name: str = "",
@@ -1006,11 +1344,11 @@ def save_report(
     """Save the final report to the project directory.
 
     Args:
-        project_path: Project directory name.
-        report_content: The full report content (markdown).
+        report_content: The full report content (markdown). This is required.
+        project_path: (optional) Project dir name. Auto-read from cache.
         report_format: "markdown" or "both" (markdown + JSON summary).
-        control_id: Control ID for the report filename (e.g. "CTRL-FIN-042").
-        control_name: Control name for the report filename.
+        control_id: (optional) Auto-read from cache.
+        control_name: (optional) Auto-read from cache.
 
     Returns:
         JSON with saved file paths, volume URL, accessible report_url, and status.
@@ -1020,6 +1358,16 @@ def save_report(
     import re as _re
     from agent.run_context import get_report_url, get_run_id, get_project_dir
     from agent import volume_store as vs
+
+    if not project_path:
+        project_path = get_project_dir() or ""
+    if not control_id or not control_name:
+        engagement = _cache_get("engagement", {})
+        co = engagement.get("control_objective", {})
+        if not control_id:
+            control_id = co.get("control_id", "")
+        if not control_name:
+            control_name = co.get("control_name", "")
 
     with mlflow.start_span(name="save_report", span_type="TOOL") as span:
         span.set_inputs({"project_path": project_path, "format": report_format})
@@ -1420,30 +1768,30 @@ def _parse_llm_analysis(raw: str) -> dict:
 
 @tool
 def aggregate_test_results(
-    batch_results_json: str,
+    batch_results_json: str = "",
 ) -> str:
     """Deterministically aggregate per-sample test results into per-attribute summaries.
 
-    Takes the raw JSON output from batch_execute_tests and produces a
-    structured test_results_json array suitable for fill_workbook and
-    compile_results. Grouping, pass/fail determination, and exception
-    counting are all done in Python — no LLM judgment involved.
-
-    Rules:
-      - One entry per ref letter.
-      - A ref is "Pass" only if ALL its samples passed.
-      - A ref is "Fail" if ANY sample failed.
-      - A ref is "Not Applicable" only if ALL samples were N/A.
-      - Otherwise "Partial".
-      - Exceptions are merged into one per failing ref.
+    NOTE: batch_execute_tests already aggregates results automatically.
+    You usually do NOT need to call this. If called with no arguments,
+    returns the pre-aggregated results from the cache.
 
     Args:
-        batch_results_json: The full JSON string returned by batch_execute_tests.
+        batch_results_json: (optional) Override batch results. Leave empty
+            to use pre-aggregated results from the cache.
 
     Returns:
         JSON array of per-attribute results, ready for fill_workbook.
     """
-    batch = json.loads(batch_results_json) if isinstance(batch_results_json, str) else batch_results_json
+    # If cache has pre-aggregated results, just return them
+    cached_agg = _cache_get("aggregated_results")
+    if cached_agg and (not batch_results_json or len(batch_results_json.strip()) < 5):
+        return json.dumps(cached_agg, indent=2)
+
+    if batch_results_json and batch_results_json.strip().startswith(("{", "[")):
+        batch = json.loads(batch_results_json)
+    else:
+        batch = _cache_get("test_results", [])
     raw_results = batch.get("results", batch) if isinstance(batch, dict) else batch
 
     by_ref: dict[str, dict] = {}
@@ -1528,26 +1876,20 @@ def aggregate_test_results(
 
 @tool
 def fill_workbook(
-    project_path: str,
-    test_results_json: str,
+    project_path: str = "",
+    test_results_json: str = "",
     control_id: str = "",
 ) -> str:
     """Fill in the engagement workbook with test results and exceptions.
 
-    Opens the original engagement_workbook.xlsx, writes test outcomes into the
-    Testing Table sheet (Answer column), and populates the Issue template sheet
-    with any exceptions. Saves the completed workbook as a run artifact.
+    All data is read automatically from the run cache. Just call
+    fill_workbook() with no arguments after batch_execute_tests.
 
     Args:
-        project_path: Project directory name (e.g. "fin_042").
-        test_results_json: JSON array of test results. Each entry should have:
-            - ref: The testing attribute ref letter (A, B, C, …)
-            - result: "Pass", "Fail", "Not Applicable", or "Partial"
-            - narrative: Explanation / finding narrative
-            - sample_items_tested: (optional) list of sample item IDs tested
-            - exceptions: (optional) list of exception dicts with description,
-              severity, affected_samples, root_cause, remediation, owner
-        control_id: Control ID for naming the output file.
+        project_path: (optional) Project dir name. Auto-read from cache.
+        test_results_json: (optional) Override test results. Auto-read from
+            aggregated_results in cache.
+        control_id: (optional) Control ID for naming.
 
     Returns:
         JSON with saved file paths, download URL, and status.
@@ -1556,6 +1898,12 @@ def fill_workbook(
     from openpyxl.styles import Font, Alignment, PatternFill
     from agent.run_context import get_run_id, get_project_dir, get_app_base_url, get_artifact_url
 
+    if not project_path:
+        project_path = get_project_dir() or ""
+    if not control_id:
+        engagement = _cache_get("engagement", {})
+        control_id = engagement.get("control_objective", {}).get("control_id", "")
+
     with mlflow.start_span(name="fill_workbook", span_type="TOOL") as span:
         span.set_inputs({"project_path": project_path, "control_id": control_id})
 
@@ -1563,7 +1911,10 @@ def fill_workbook(
         wb_content = _read_file_bytes(wb_path)
         wb = openpyxl.load_workbook(io.BytesIO(wb_content))
 
-        test_results = json.loads(test_results_json)
+        if test_results_json and test_results_json.strip().startswith("["):
+            test_results = json.loads(test_results_json)
+        else:
+            test_results = _cache_get("aggregated_results", [])
 
         results_by_ref = {}
         for tr in test_results:
@@ -1838,19 +2189,24 @@ def _execute_single_test(
 
 @tool
 def batch_review_evidence(
-    evidence_files_json: str,
-    project_path: str,
-    control_context: str,
+    evidence_files_json: str = "",
+    project_path: str = "",
+    control_context: str = "",
 ) -> str:
     """Review ALL evidence files in parallel. Call this INSTEAD of reviewing
     files one-by-one. Dispatches PDFs to review_document, images to
     review_screenshot, and .eml files to analyze_email — all concurrently.
 
+    Data is read automatically from the run cache — just call
+    batch_review_evidence() with no arguments after load_engagement.
+
     Args:
-        evidence_files_json: JSON array of evidence file objects from
-            engagement.evidence_files. Each must have path, type, and focus.
-        project_path: Project directory name (e.g. "fin_042").
-        control_context: JSON string with control_id, control_name, rules.
+        evidence_files_json: (optional) Override evidence files list. Leave
+            empty to use engagement.evidence_files from cache.
+        project_path: (optional) Project directory name. Leave empty to use
+            cached project_dir.
+        control_context: (optional) Override control context. Leave empty
+            to use cached engagement data.
 
     Returns:
         JSON with reviews list (one per file) and aggregate stats.
@@ -1858,9 +2214,20 @@ def batch_review_evidence(
     import time as _time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from agent.config import MAX_PARALLEL_EVIDENCE
-    from agent.run_context import snapshot_context, restore_context
+    from agent.run_context import snapshot_context, restore_context, get_project_dir
 
-    evidence_files = json.loads(evidence_files_json) if isinstance(evidence_files_json, str) else evidence_files_json
+    if evidence_files_json and evidence_files_json.strip().startswith("["):
+        evidence_files = json.loads(evidence_files_json)
+    else:
+        engagement = _cache_get("engagement", {})
+        evidence_files = engagement.get("evidence_files", [])
+
+    if not project_path:
+        project_path = get_project_dir() or ""
+
+    if not control_context or not control_context.strip().startswith("{"):
+        engagement = _cache_get("engagement", {})
+        control_context = json.dumps(engagement.get("control_objective", {}))
     evidence_files = sorted(evidence_files, key=lambda f: f.get("path", ""))
     ctx_snapshot = snapshot_context()
 
@@ -1932,40 +2299,65 @@ def batch_review_evidence(
             "parallel_workers": MAX_PARALLEL_EVIDENCE,
         })
 
-    return json.dumps({
+    evidence_result = {
         "reviews": reviews,
         "files_reviewed": len(reviews),
         "errors": errors,
         "elapsed_seconds": elapsed,
         "parallel_workers": MAX_PARALLEL_EVIDENCE,
-    }, indent=2)
+    }
+    # Build a text summary for the cache so downstream tools can use it
+    summary_parts = []
+    for rev in reviews:
+        fp = rev.get("file_path", "")
+        analysis = rev.get("analysis", "")[:500]
+        summary_parts.append(f"[{fp}]: {analysis}")
+    _cache_set("evidence_summary", "\n\n".join(summary_parts))
+    _cache_set("evidence_result", evidence_result)
+    return json.dumps(evidence_result, indent=2)
 
 
 @tool
 def batch_execute_tests(
-    test_plan_json: str,
-    control_context: str,
-    evidence_summary: str,
+    test_plan_json: str = "",
+    control_context: str = "",
+    evidence_summary: str = "",
 ) -> str:
     """Execute ALL tests from the test plan in parallel. Call this INSTEAD
     of calling execute_test one-by-one.
 
+    Data is read automatically from the run cache — just call
+    batch_execute_tests() with no arguments after generate_test_plan.
+
     Args:
-        test_plan_json: The full test_plan array from generate_test_plan output.
-        control_context: JSON string with control_objective and rules.
-        evidence_summary: Combined evidence review summaries from
-            batch_review_evidence output.
+        test_plan_json: (optional) Override test plan. Leave empty to use
+            cached data from generate_test_plan.
+        control_context: (optional) Override control context. Leave empty
+            to use cached data.
+        evidence_summary: (optional) Override evidence summary. Leave empty
+            to use cached data from batch_review_evidence.
 
     Returns:
-        JSON with results list (one per test), pass/fail counts,
-        and aggregate timing.
+        JSON with aggregated_results per attribute, pass/fail counts, and timing.
     """
     import time as _time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from agent.config import MAX_PARALLEL_TESTS
     from agent.run_context import snapshot_context, restore_context
 
-    test_plan = json.loads(test_plan_json) if isinstance(test_plan_json, str) else test_plan_json
+    if test_plan_json and test_plan_json.strip().startswith("["):
+        test_plan = json.loads(test_plan_json)
+    elif test_plan_json and test_plan_json.strip().startswith("{"):
+        parsed = json.loads(test_plan_json)
+        test_plan = parsed.get("test_plan", parsed.get("results", []))
+    else:
+        test_plan = _cache_get("test_plan", [])
+
+    if not control_context or not control_context.strip().startswith("{"):
+        control_context = _cache_get("control_context", "{}")
+
+    if not evidence_summary or len(evidence_summary.strip()) < 10:
+        evidence_summary = _cache_get("evidence_summary", "")
     test_plan = sorted(test_plan, key=lambda e: (e.get("test_ref", ""), e.get("sample_item_json", "")))
     ctx_snapshot = snapshot_context()
 
@@ -2068,8 +2460,20 @@ def batch_execute_tests(
             "parallel_workers": MAX_PARALLEL_TESTS,
         })
 
+    # Auto-aggregate results so downstream tools don't need the massive raw JSON
+    aggregated = _aggregate_results_internal(results)
+    _cache_set("test_results", results)
+    _cache_set("aggregated_results", aggregated)
+    _cache_set("test_summary", {
+        "total_tests": len(results),
+        "passed": pass_count,
+        "failed": fail_count,
+        "confidence_counts": confidence_counts,
+        "low_confidence_refs": low_confidence_refs,
+    })
+
     return json.dumps({
-        "results": results,
+        "aggregated_results": aggregated,
         "total_tests": len(results),
         "passed": pass_count,
         "failed": fail_count,
@@ -2079,5 +2483,74 @@ def batch_execute_tests(
         "elapsed_seconds": elapsed,
         "parallel_workers": MAX_PARALLEL_TESTS,
     }, indent=2)
+
+
+def _aggregate_results_internal(results: list[dict]) -> list[dict]:
+    """Run the same aggregation logic as aggregate_test_results, inline."""
+    by_ref: dict[str, dict] = {}
+    for entry in results:
+        ref = entry.get("test_ref", "?").strip().upper()
+        sample = entry.get("sample_item", {})
+        if isinstance(sample, str):
+            try:
+                sample = json.loads(sample)
+            except json.JSONDecodeError:
+                sample = {}
+        parsed = _parse_llm_analysis(entry.get("llm_analysis", "{}"))
+        sample_id = _extract_sample_id(sample)
+        result_lower = parsed.get("result", "Unknown").strip().lower()
+        if ref not in by_ref:
+            by_ref[ref] = {"results": [], "narratives": [], "sample_ids": [], "exceptions": []}
+        bucket = by_ref[ref]
+        bucket["results"].append(result_lower)
+        bucket["narratives"].append(f"[{sample_id}]: {parsed.get('narrative', '')}")
+        bucket["sample_ids"].append(sample_id)
+        if result_lower == "fail":
+            bucket["exceptions"].append({
+                "description": parsed.get("exception") or parsed.get("narrative", "Test failed"),
+                "severity": parsed.get("severity", "Medium"),
+                "sample_id": sample_id,
+            })
+
+    aggregated = []
+    for ref in sorted(by_ref.keys()):
+        bucket = by_ref[ref]
+        results_set = set(bucket["results"])
+        if results_set == {"pass"}:
+            agg_result = "Pass"
+        elif "fail" in results_set:
+            agg_result = "Fail"
+        elif results_set <= {"not applicable"}:
+            agg_result = "Not Applicable"
+        else:
+            agg_result = "Partial"
+
+        merged_exceptions = []
+        if bucket["exceptions"]:
+            all_affected = sorted({e["sample_id"] for e in bucket["exceptions"]})
+            descriptions = []
+            severity = "Medium"
+            severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+            for exc in bucket["exceptions"]:
+                descriptions.append(exc["description"])
+                exc_sev = exc.get("severity", "Medium")
+                if severity_rank.get(exc_sev.lower(), 0) > severity_rank.get(severity.lower(), 0):
+                    severity = exc_sev
+            merged_exceptions = [{
+                "description": "; ".join(dict.fromkeys(descriptions)),
+                "severity": severity,
+                "affected_samples": all_affected,
+                "root_cause": "See test narrative",
+                "remediation": "Review and remediate",
+            }]
+
+        aggregated.append({
+            "ref": ref,
+            "result": agg_result,
+            "narrative": "\n".join(bucket["narratives"]),
+            "sample_items_tested": bucket["sample_ids"],
+            "exceptions": merged_exceptions,
+        })
+    return aggregated
 
 

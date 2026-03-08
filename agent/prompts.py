@@ -84,51 +84,31 @@ This extracts and analyzes screenshots/photos that are pasted directly into Exce
 tabs. Common for EHS inspections, IT screenshots, and factory evidence.
 
 ### Step 3: Review Evidence Documents (Parallel)
-Call `batch_review_evidence` with the FULL `evidence_files` array as `evidence_files_json`, \
-the `project_path`, and the `control_context`. This reviews ALL files in parallel.
-
-Embedded workbook images are already handled by Step 2b.
-
-If you need to review a single additional file later (e.g. during test execution), \
-use the individual tools (`review_document`, `review_screenshot`, `analyze_email`).
+Call `batch_review_evidence()` with NO arguments. It automatically reads the \
+evidence files list from the engagement loaded in Step 1.
 
 ### Step 4: Generate the Test Plan
-Call `generate_test_plan(engagement_json, workbook_json)` passing the FULL JSON \
-outputs from load_engagement and parse_workbook. This computes the exact, \
-deterministic list of tests to execute.
+Call `generate_test_plan()` with NO arguments. It automatically reads the \
+engagement and workbook data from Steps 1-2.
 
 ### Step 5: Execute Tests (Parallel)
-Call `batch_execute_tests` with the FULL `test_plan` array as `test_plan_json`, \
-the `control_context` JSON, and the combined `evidence_summary` from Step 3.
-
-This executes ALL tests in parallel with concurrency control. Every entry in the \
-test plan is executed — none are skipped.
-
-If you need to re-run a single test (e.g. after reviewing additional evidence), \
-use `execute_test` individually.
-
-### Step 5b: Aggregate Test Results (Deterministic)
-Call `aggregate_test_results(batch_results_json)` passing the FULL JSON output \
-from batch_execute_tests as a string. This tool deterministically groups \
-per-sample results into per-attribute summaries using Python — no LLM judgment. \
-It produces the `test_results_json` array needed by both compile_results and \
-fill_workbook.
-
-**CRITICAL**: Pass the output of aggregate_test_results DIRECTLY to \
-compile_results and fill_workbook as the `test_results_json` parameter. \
-Do NOT manually compose, modify, reformat, or reinterpret it.
+Call `batch_execute_tests()` with NO arguments. It automatically reads the \
+test plan, control context, and evidence summary from previous steps. \
+Results are automatically aggregated — you do NOT need to call \
+aggregate_test_results separately.
 
 ### Step 6: Compile Results
-Call `compile_results` with all test findings. Use the aggregate_test_results \
-output as the `test_results_json` parameter.
+Call `compile_results()` with NO arguments. It automatically reads all \
+engagement metadata, testing attributes, and aggregated test results.
 
 ### Step 7: Fill Out the Workbook
-Call `fill_workbook(project_path, test_results_json, control_id)`. \
-Pass the aggregate_test_results output directly as `test_results_json`.
+Call `fill_workbook()` with NO arguments. It automatically reads \
+the project path, aggregated results, and control ID.
 
 ### Step 8: Save the Report
-Call `save_report(project_path, report_content, control_id=control_id)`. The response includes a \
-`report_url` — this is a clickable link to view the full report in the app.
+Call `save_report(report_content=<the report from compile_results>)`. \
+Only the `report_content` parameter is required — everything else is auto-read. \
+The response includes a `report_url` — a clickable link to view the report.
 
 ### Step 9: Email the Report (if configured)
 If the engagement has a `notification_emails` field, call `send_email`. \
@@ -249,7 +229,8 @@ Respond ONLY with the JSON object, no other text.
 """
 
 REPORT_GENERATION_PROMPT = """\
-Generate the final Controls Evidence Review Report based on completed testing.
+You are writing the Executive Summary and Overall Control Assessment sections \
+of a compliance audit report. Respond ONLY with a JSON object — nothing else.
 
 **Control**: {control_id} - {control_name}
 **Domain**: {domain}
@@ -257,43 +238,17 @@ Generate the final Controls Evidence Review Report based on completed testing.
 **Population Size**: {population_size}
 **Sample Size**: {sample_size}
 
-**Testing Attributes**:
-{testing_attributes}
+**Test Results Summary**:
+{test_results}
 
 **Control-Specific Rules**:
 {rules}
 
-**Test Results**:
-{test_results}
-
-Produce a structured report with these sections:
-
-## 1. Executive Summary
-2-3 sentences summarising the overall assessment.
-
-## 2. Testing Scope and Methodology
-Describe the population, sampling approach, and testing attributes.
-
-## 3. Control-Level Summary
-For each testing attribute, provide the narrative summary.
-
-## 4. Results Summary Table
-| Attribute | Result | Confidence | Severity | Exceptions |
-|-----------|--------|------------|----------|------------|
-
-Confidence values: High, Medium, or Low. Flag any "Low" confidence results \
-for mandatory human review in the Overall Assessment section.
-
-## 5. Exception Details
-For each exception: Issue ID, Attribute, Severity, Description, Affected Samples, \
-Root Cause, Remediation.
-
-## 6. Overall Control Assessment
-**Effective** / **Effective with Exceptions** / **Ineffective** with justification.
-
-If any test result has **Low** confidence, note it here and recommend those \
-specific attributes for manual re-review by a senior auditor.
-
-## 7. Issue Template (Ready to Paste)
-| Issue_ID | Testing_Attribute | Severity | Description | Affected_Samples | Root_Cause | Remediation | Owner | Due_Date | Status |
+Respond with exactly this JSON (no markdown fences, no extra text):
+{{
+  "executive_summary": "2-3 sentence summary of the overall assessment result.",
+  "overall_assessment": "Effective" or "Effective with Exceptions" or "Ineffective",
+  "overall_justification": "1-2 sentence justification for the assessment rating.",
+  "low_confidence_advisory": "If any results have Low confidence, note them here. Otherwise empty string."
+}}
 """

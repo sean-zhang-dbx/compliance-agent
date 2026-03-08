@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import type { ToolStep, Engagement, EvidenceFile, RunInfo, SubProgress } from "../api";
+import type { ToolStep, Engagement, EvidenceFile, RunInfo, RunArtifact, SubProgress } from "../api";
 import type { ProjectInfo } from "../api";
 import { fetchArtifact, fetchEngagement, getEvidenceUrl, downloadBinaryArtifact, listRuns, fetchRunManifest } from "../api";
 
@@ -42,9 +42,19 @@ function volumePathToUrl(volPath: string): string | null {
   const vm = volPath.match(/^\/Volumes\/([^/]+)\/([^/]+)\/([^/]+)(\/.*)?$/);
   if (!vm) return null;
   const [, catalog, schema, volume] = vm;
-  const hm = window.location.hostname.match(/-(\d{10,})\.(\d+)\.azure\.databricksapps\.com$/);
-  if (!hm) return null;
-  return `https://adb-${hm[1]}.${hm[2]}.azuredatabricks.net/explore/data/volumes/${catalog}/${schema}/${volume}`;
+  const hostname = window.location.hostname;
+
+  const azureMatch = hostname.match(/-(\d{10,})\.(\d+)\.azure\.databricksapps\.com$/);
+  if (azureMatch) {
+    return `https://adb-${azureMatch[1]}.${azureMatch[2]}.azuredatabricks.net/explore/data/volumes/${catalog}/${schema}/${volume}`;
+  }
+
+  const awsMatch = hostname.match(/-(\d{10,})\.aws\.databricksapps\.com$/);
+  if (awsMatch) {
+    return `https://dbc-${awsMatch[1]}.cloud.databricks.com/explore/data/volumes/${catalog}/${schema}/${volume}`;
+  }
+
+  return null;
 }
 
 /* ─── Icon & description maps ─── */
@@ -275,14 +285,19 @@ export default function ExecutionPanel({
   const [historySteps, setHistorySteps] = useState<ToolStep[]>([]);
   const [historyRunId, setHistoryRunId] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [runArtifacts, setRunArtifacts] = useState<RunArtifact[]>([]);
   const stepStartTimes = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
     if (projectDir) {
       fetchEngagement(projectDir).then((e) => e && setEngagement(e));
-      listRuns(projectDir).then((runs) => setPastRuns(runs));
+      listRuns(projectDir).then((runs) => {
+        setPastRuns(runs);
+        const currentRun = runs.find((r) => r.run_id === runId);
+        if (currentRun?.artifacts) setRunArtifacts(currentRun.artifacts);
+      });
     }
-  }, [projectDir]);
+  }, [projectDir, runId]);
 
   useEffect(() => { if (isRunning) setViewMode("live"); }, [isRunning]);
 
@@ -334,10 +349,15 @@ export default function ExecutionPanel({
     setHistoryLoading(true);
     setHistoryRunId(run.run_id);
     setViewMode("history");
+    if (run.artifacts) setRunArtifacts(run.artifacts);
     try {
       const manifest = await fetchRunManifest(projectDir, run.run_id);
       if (manifest?.steps) setHistorySteps(manifest.steps);
       else setHistorySteps([]);
+      const manifestArtifacts = (manifest as Record<string, unknown>)?.artifacts;
+      if (Array.isArray(manifestArtifacts) && manifestArtifacts.length > 0) {
+        setRunArtifacts(manifestArtifacts as RunArtifact[]);
+      }
     } catch { setHistorySteps([]); }
     finally { setHistoryLoading(false); }
   };
@@ -786,6 +806,52 @@ export default function ExecutionPanel({
                   </div>
                 </div>
               )}
+
+              {/* All downloadable files */}
+              {(() => {
+                const effectiveRunId = viewMode === "history" ? historyRunId : runId;
+                const topLevelFiles = runArtifacts.filter(
+                  (a) => !a.location && !a.filename.endsWith(".json") && a.filename !== "run_manifest.json"
+                );
+                const shownNames = new Set<string>();
+                if (wbFilename) shownNames.add(wbFilename);
+                shownNames.add("report.md");
+                const extraFiles = topLevelFiles.filter((a) => !shownNames.has(a.filename));
+                if (extraFiles.length === 0) return null;
+                return (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "#9ca3af", marginBottom: 6 }}>Additional Files</div>
+                    {extraFiles.map((a, i) => {
+                      const isBinary = /\.(xlsx|pdf|png|jpg|jpeg)$/i.test(a.filename);
+                      const icon = a.filename.endsWith(".md") ? "📝" : a.filename.endsWith(".xlsx") ? "📊" : "📎";
+                      return (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 6, background: "#f9fafb", marginBottom: 4, cursor: "pointer", border: "1px solid #e5e7eb" }}
+                          onClick={async () => {
+                            if (!projectDir || !effectiveRunId) return;
+                            if (isBinary) {
+                              await downloadBinaryArtifact(projectDir, effectiveRunId, a.filename);
+                            } else {
+                              try {
+                                const content = await fetchArtifact(projectDir, effectiveRunId, a.filename);
+                                setArtifactContent(content);
+                                setShowReport(true);
+                                setReportContent(content);
+                              } catch { /* ignore */ }
+                            }
+                          }}
+                        >
+                          <span style={{ fontSize: 14 }}>{icon}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 11, fontWeight: 500, color: "#374151", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" as const }}>{a.filename}</div>
+                            <div style={{ fontSize: 9, color: "#9ca3af" }}>{a.tool === "_system" ? "System" : a.tool}</div>
+                          </div>
+                          <span style={{ fontSize: 10, color: "#9ca3af" }}>↓</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
               {/* Run ID */}
               {displayRunId && (

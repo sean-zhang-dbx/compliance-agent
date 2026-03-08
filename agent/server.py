@@ -797,7 +797,9 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                 )
                 from langchain_core.messages import AIMessage, ToolMessage
 
+                from agent.graph import _reset_iteration_state
                 clear_cancel()
+                _reset_iteration_state()
                 set_run_context(
                     run_id=run_id,
                     project_dir=project_dir,
@@ -995,6 +997,20 @@ def create_app(*, frontend_dirs: list[Path] | None = None) -> FastAPI:
                                                 "tool": "fill_workbook",
                                                 "volume_path": xlsx_vol,
                                             })
+
+                                        if short_name == "save_report":
+                                            try:
+                                                sr_data = json.loads(result_str)
+                                                sr_fname = sr_data.get("filename", "")
+                                                sr_vol = sr_data.get("volume_url", "")
+                                                if sr_fname and sr_fname.endswith(".md"):
+                                                    manifest["artifacts"].append({
+                                                        "filename": sr_fname,
+                                                        "tool": "save_report",
+                                                        "volume_path": sr_vol or "",
+                                                    })
+                                            except Exception:
+                                                pass
 
                         for stream_ev in output_to_responses_items_stream(msgs):
                             if stream_ev.type == "response.output_item.done":

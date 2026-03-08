@@ -97,20 +97,68 @@ class AgentState(TypedDict):
 
 MAX_RETRIES = 6
 BACKOFF_BASE = 5
+MAX_AGENT_ITERATIONS = 25
+MAX_CONSECUTIVE_NO_TOOL = 2
+
+_iteration_count = threading.local()
+_no_tool_streak = threading.local()
+
+
+def _reset_iteration_state():
+    _iteration_count.value = 0
+    _no_tool_streak.value = 0
 
 
 def _should_continue(state: AgentState) -> str:
     if is_cancelled():
         return "end"
+
+    iters = getattr(_iteration_count, "value", 0)
+    if iters >= MAX_AGENT_ITERATIONS:
+        print(f"[guardrail] Hit max iterations ({MAX_AGENT_ITERATIONS}). Ending.")
+        return "end"
+
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
+        _no_tool_streak.value = 0
         return "tools"
+
+    streak = getattr(_no_tool_streak, "value", 0) + 1
+    _no_tool_streak.value = streak
+    if streak >= MAX_CONSECUTIVE_NO_TOOL:
+        print(f"[guardrail] {streak} consecutive responses without tool calls. Ending.")
+        return "end"
+
+    if isinstance(last, AIMessage) and last.content:
+        content = last.content if isinstance(last.content, str) else str(last.content)
+        has_pseudo_call = any(
+            t in content for t in [
+                "announce_plan(", "parse_workbook(", "batch_review_evidence(",
+                "generate_test_plan(", "batch_execute_tests(", "compile_results(",
+                "fill_workbook(", "save_report(", "load_engagement(",
+            ]
+        )
+        if has_pseudo_call:
+            print("[guardrail] Detected pseudo-tool-call in text (model drift). Injecting reminder.")
+            from langchain_core.messages import HumanMessage
+            state["messages"].append(HumanMessage(
+                content="SYSTEM: You wrote tool calls as plain text instead of making "
+                "structured function calls. Please call the next tool using a proper "
+                "function call, not as text. Continue the workflow."
+            ))
+            return "tools_redirect"
+
     return "end"
 
 
 def _call_model(state: AgentState) -> dict:
     if is_cancelled():
         raise CancelledError("Run cancelled by user")
+
+    _iteration_count.value = getattr(_iteration_count, "value", 0) + 1
+    current = getattr(_iteration_count, "value", 0)
+    if current > MAX_AGENT_ITERATIONS:
+        raise CancelledError(f"Max agent iterations ({MAX_AGENT_ITERATIONS}) exceeded")
 
     from databricks_langchain import ChatDatabricks
 
@@ -141,6 +189,8 @@ def _call_model(state: AgentState) -> dict:
 
 def build_graph() -> Any:
     """Build and compile the LangGraph state machine."""
+    _reset_iteration_state()
+
     graph = StateGraph(AgentState)
 
     graph.add_node("agent", RunnableLambda(_call_model))
@@ -151,7 +201,7 @@ def build_graph() -> Any:
     graph.add_conditional_edges(
         "agent",
         _should_continue,
-        {"tools": "tools", "end": END},
+        {"tools": "tools", "tools_redirect": "agent", "end": END},
     )
     graph.add_edge("tools", "agent")
 

@@ -150,7 +150,12 @@ def list_dir(vol_path: str) -> list[Any]:
 
 
 def list_runs(project_dir: str) -> list[dict]:
-    """List all runs for a project, newest first."""
+    """List all runs for a project, newest first.
+
+    Each run includes an ``artifacts`` list with downloadable file entries
+    (filename, tool, location) so the frontend can render download links
+    without a separate manifest fetch.
+    """
     runs_base = f"{_volume_base()}/{project_dir}/runs"
     items = list_dir(runs_base)
     runs = []
@@ -162,12 +167,24 @@ def list_runs(project_dir: str) -> list[dict]:
         try:
             manifest_path = f"{runs_base}/{run_id}/run_manifest.json"
             m = json.loads(download_text(manifest_path))
+            raw_artifacts = m.get("artifacts", [])
+            downloadable = [
+                {
+                    "filename": a["filename"],
+                    "tool": a.get("tool", ""),
+                    "location": a.get("location", ""),
+                }
+                for a in raw_artifacts
+                if a.get("filename")
+                and not a["filename"].endswith("run_manifest.json")
+            ]
             run_info.update({
                 "status": m.get("status", "unknown"),
                 "started_at": m.get("started_at", ""),
                 "completed_at": m.get("completed_at", ""),
                 "total_steps": m.get("total_steps", 0),
-                "artifact_count": len(m.get("artifacts", [])),
+                "artifact_count": len(downloadable),
+                "artifacts": downloadable,
             })
         except Exception:
             pass

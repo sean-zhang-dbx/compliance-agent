@@ -54,6 +54,12 @@ export interface UploadResult {
   status: string;
 }
 
+export interface RunArtifact {
+  filename: string;
+  tool: string;
+  location?: string;
+}
+
 export interface RunInfo {
   run_id: string;
   status?: string;
@@ -61,6 +67,7 @@ export interface RunInfo {
   completed_at?: string;
   total_steps?: number;
   artifact_count?: number;
+  artifacts?: RunArtifact[];
 }
 
 function extractText(data: Record<string, unknown>): string {
